@@ -216,17 +216,32 @@ class BasicHeuristicTests(unittest.TestCase):
         fetch.assert_called_once_with("example/project", "t")
 
 
+def github_open_via_urlopen(
+    request: urllib.request.Request,
+    *,
+    timeout: int,
+) -> Any:
+    return urllib.request.urlopen(request, timeout=timeout)
+
+
 class HttpAndPlatformTests(unittest.TestCase):
+    def setUp(self) -> None:
+        patcher = patch.object(github, "_github_open", side_effect=github_open_via_urlopen)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_github_get_optional_success_failure_and_auth(self) -> None:
         with patch.object(
             urllib.request,
             "urlopen",
             return_value=FakeResponse(b'{"html_url":"x"}'),
         ) as opened:
-            self.assertEqual(scout.github_get_optional("https://x", "tok"), {"html_url": "x"})
+            self.assertEqual(
+                scout.github_get_optional("https://api.github.com/x", "tok"), {"html_url": "x"}
+            )
             self.assertEqual(opened.call_args.args[0].headers["Authorization"], "Bearer tok")
         with patch.object(urllib.request, "urlopen", side_effect=OSError("x")):
-            self.assertIsNone(scout.github_get_optional("https://x", None))
+            self.assertIsNone(scout.github_get_optional("https://api.github.com/x", None))
 
     def test_issue_comments_paths(self) -> None:
         self.assertEqual(scout.issue_comments({"html_url": "bad", "comments": 2}, "t"), [])
@@ -816,6 +831,39 @@ class VerificationTests(unittest.TestCase):
             patch.object(scout, "build_candidate", return_value={"ok": True}),
         ):
             self.assertEqual(scout.verify(fresh, "t", {}, {}, True), ({"ok": True}, None))
+
+    def test_verify_prefers_canonical_paid_signal_without_loading_comments(self) -> None:
+        fresh = issue(body="bounty $100", comments=2)
+        metadata = repo_meta()
+        with (
+            patch.object(scout, "refresh_issue", return_value=(fresh, None)),
+            patch.object(paid_policy, "payment_signal", return_value="issue payment signal: $100"),
+            patch.object(
+                paid_verification,
+                "candidate_rejection_reason",
+                return_value=(None, "verified payment signal: $250"),
+            ),
+            patch.object(github, "issue_comments_checked") as comments_checked,
+            patch.object(scout, "comment_payment_signal") as comment_signal,
+            patch.object(scout, "fetch_repo_metadata", return_value=metadata),
+            patch.object(scout, "contribution_guide", return_value=None),
+            patch.object(scout, "build_candidate", return_value={"ok": True}) as build,
+        ):
+            self.assertEqual(
+                scout.verify(fresh, "t", {}, {}, require_paid=True),
+                ({"ok": True}, None),
+            )
+
+        comments_checked.assert_not_called()
+        comment_signal.assert_not_called()
+        build.assert_called_once_with(
+            fresh,
+            "paid",
+            "verified payment signal: $250",
+            metadata,
+            None,
+            None,
+        )
 
     def test_verify_rejects_hall_of_fame_before_paid_scoring(self) -> None:
         fresh = issue(

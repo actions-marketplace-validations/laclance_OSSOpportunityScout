@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from opportunity_scout import github, paid_verification
 from opportunity_scout.strategic import competition
@@ -56,6 +56,12 @@ class ClaimCompetitionTests(unittest.TestCase):
         self.assertIsNone(
             competition.strategic_claim_reason(
                 issue(body="I've implemented this locally.", created_at=stale),
+                [],
+            )
+        )
+        self.assertIsNone(
+            competition.strategic_claim_reason(
+                issue(body="This needs an implementation decision.", created_at=recent),
                 [],
             )
         )
@@ -284,6 +290,18 @@ class ClaimCompetitionTests(unittest.TestCase):
                 ],
             )
         )
+        self.assertIsNone(
+            competition.strategic_claim_reason(
+                issue(html_url="https://github.com/nodejs/undici/issues/5912", body=""),
+                [
+                    {
+                        "body": "https://github.com/observer/undici/tree/fetch/issue-6000",
+                        "updated_at": recent,
+                        "user": {"login": "observer"},
+                    }
+                ],
+            )
+        )
 
     def test_claim_reason_handles_unidentifiable_issue_without_branch_matching(self) -> None:
         self.assertIsNone(
@@ -338,7 +356,13 @@ class LinkedPullRequestTests(unittest.TestCase):
                 competition.linked_open_pr_reason(issue(), "t", comments),
                 "existing open implementation PR: https://github.com/example/project/pull/11",
             )
-            self.assertEqual(getter.call_count, 2)
+            self.assertEqual(
+                getter.call_args_list,
+                [
+                    call("https://api.github.com/repos/example/project/pulls/10", "t"),
+                    call("https://api.github.com/repos/example/project/pulls/11", "t"),
+                ],
+            )
 
     def test_linked_pr_uses_same_repo_urls_and_fails_closed_on_unusable_results(self) -> None:
         comments: list[GitHubComment] = [
