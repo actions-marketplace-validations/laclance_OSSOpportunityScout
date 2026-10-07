@@ -216,6 +216,143 @@ class EffortCalibrationTests(unittest.TestCase):
                 self.assertEqual(estimate.bucket, "3–6h")
                 self.assertEqual(estimate.reasons, ("moderate implementation scope",))
 
+    def test_report_11_android_tv_device_reproduction_raises_effort(self) -> None:
+        estimate = scoring.estimate_effort_details(
+            issue(
+                title="AndroidTV: weird state when Subnet routing is enabled",
+                body=(
+                    "### Steps to reproduce\n\n"
+                    "1. Configure a machine with subnets.\n"
+                    "2. Add a new AndroidTV device.\n"
+                    "3. Try to connect with Subnet routes enabled.\n\n"
+                    "OS version: AndroidTV 11"
+                ),
+                labels=[{"name": "bug"}],
+            )
+        )
+        self.assertEqual(estimate.bucket, "6–12h")
+        self.assertEqual(estimate.reasons, ("specialized device reproduction/setup",))
+
+        ordinary_android = scoring.estimate_effort_details(
+            issue(
+                title="Android client reconnect regression",
+                body=(
+                    "### Steps to reproduce\n\n"
+                    "Open the Android app on a smartphone and reconnect twice."
+                ),
+                labels=[{"name": "bug"}],
+            )
+        )
+        self.assertEqual(ordinary_android.bucket, "3–6h")
+        self.assertEqual(ordinary_android.reasons, ("moderate implementation scope",))
+
+    def test_report_11_constrained_network_reproduction_raises_effort(self) -> None:
+        estimate = scoring.estimate_effort_details(
+            issue(
+                title=(
+                    "DERP server is blocked on a restrictive network but direct connection works"
+                ),
+                body=(
+                    "### Steps to reproduce\n\n"
+                    "1. Connect from an open network.\n"
+                    "2. Move to a restrictive network that blocks the Tailscale coordination "
+                    "server and DERP relays.\n"
+                    "3. Direct connection should work, but the client keeps trying the blocked "
+                    "relay path."
+                ),
+                labels=[{"name": "bug"}],
+            )
+        )
+        self.assertEqual(estimate.bucket, "6–12h")
+        self.assertEqual(estimate.reasons, ("constrained network reproduction/setup",))
+
+        ordinary_network = scoring.estimate_effort_details(
+            issue(
+                title="Connection fails on restrictive network",
+                body=(
+                    "### Steps to reproduce\n\n"
+                    "Connect through the office firewall and observe a timeout."
+                ),
+                labels=[{"name": "bug"}],
+            )
+        )
+        self.assertEqual(ordinary_network.bucket, "3–6h")
+        self.assertEqual(ordinary_network.reasons, ("moderate implementation scope",))
+
+    def test_report_11_api_memory_tradeoff_raises_effort(self) -> None:
+        estimate = scoring.estimate_effort_details(
+            issue(
+                title=(
+                    "xds/clients: cache raw resource bytes internally for CSDS "
+                    "and remove Bytes() from ResourceData"
+                ),
+                body=(
+                    "Remove Bytes() from the ResourceData interface and retain the raw resource "
+                    "bytes internally. The downside of removing Bytes() is a memory trade-off "
+                    "for external consumers that do not use CSDS, because raw bytes may remain "
+                    "in memory alongside decoded ResourceData."
+                ),
+                labels=[{"name": "P2"}],
+            )
+        )
+        self.assertEqual(estimate.bucket, "6–12h")
+        self.assertEqual(
+            estimate.reasons,
+            ("API/interface change with explicit memory trade-off",),
+        )
+
+        api_without_tradeoff = scoring.estimate_effort_details(
+            issue(
+                title="Change client metadata type",
+                body=(
+                    "Change the client API field from any to map[string]any and validate it "
+                    "during initialization."
+                ),
+                labels=[{"name": "P2"}],
+            )
+        )
+        self.assertEqual(api_without_tradeoff.bucket, "3–6h")
+        self.assertEqual(api_without_tradeoff.reasons, ("moderate implementation scope",))
+
+    def test_report_11_diagnosed_one_file_bug_gets_quick_bucket(self) -> None:
+        estimate = scoring.estimate_effort_details(
+            issue(
+                title="net/tsdial: ExtraRecords IPv6 overwrites IPv4 in dnsMap",
+                body=(
+                    "When dnsMapFromNetworkMap processes DNS.ExtraRecords, later records for "
+                    "the same name overwrite earlier ones. The peers loop handles this correctly "
+                    "by checking have4 and breaking after the first match. The ExtraRecords loop "
+                    "doesn't do either of those things. "
+                    "https://github.com/tailscale/tailscale/blob/main/net/tsdial/dnsmap.go#L67-L76"
+                ),
+            )
+        )
+        self.assertEqual(estimate.bucket, "1–3h")
+        self.assertEqual(estimate.reasons, ("diagnosed one-file code-path fix",))
+
+    def test_local_diagnosis_requires_single_file_and_known_correct_analogue(self) -> None:
+        cases = (
+            issue(
+                title="Cache entry overwritten",
+                body=(
+                    "The cache overwrites the previous entry in pkg/cache.go. "
+                    "The root cause is known, but there is no existing correct code path to copy."
+                ),
+            ),
+            issue(
+                title="Two parser paths diverge",
+                body=(
+                    "The peer loop handles this correctly, but parser A does not. "
+                    "See pkg/a.go and pkg/b.go."
+                ),
+            ),
+        )
+        for item in cases:
+            with self.subTest(title=item.get("title")):
+                estimate = scoring.estimate_effort_details(item)
+                self.assertEqual(estimate.bucket, "3–6h")
+                self.assertEqual(estimate.reasons, ("moderate implementation scope",))
+
     def test_contextual_bounded_scope_still_gets_quick_bug_bucket(self) -> None:
         estimate = scoring.estimate_effort_details(
             issue(

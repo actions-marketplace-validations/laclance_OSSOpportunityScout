@@ -348,11 +348,42 @@ def estimate_effort_details(
         for marker in ("os-android", "os-ios", "os-macos", "os-windows")
     )
     missing_reproduction = "_no response_" in evidence.text or "no response" in evidence.text
+    specialized_device_repro = bool(
+        re.search(
+            r"\b(?:android\s*tv|androidtv|apple\s*tv|tvos|fire\s*tv|roku)\b",
+            evidence.text,
+        )
+        and re.search(r"\b(?:steps to reproduce|reproduc(?:e|tion))\b", evidence.text)
+        and re.search(r"\bdevice\b", evidence.text)
+    )
+    constrained_network_repro = bool(
+        re.search(r"\brestrictive network\b", evidence.text)
+        and re.search(
+            r"\b(?:blocks?|blocked)\b.{0,120}\b(?:coordination server|derp(?: servers?| relays?))\b",
+            evidence.text,
+        )
+        and re.search(r"\bdirect connection\b", evidence.text)
+        and re.search(r"\b(?:steps to reproduce|reproduc(?:e|tion))\b", evidence.text)
+    )
+    api_memory_tradeoff = bool(
+        re.search(
+            r"\b(?:remove|change)\b.{0,180}\b(?:interface|api)\b",
+            evidence.text,
+        )
+        and re.search(
+            r"\b(?:memory trade-off|memory impact|retain(?:ed|ing)? raw (?:resource )?bytes)\b",
+            evidence.text,
+        )
+        and re.search(r"\bexternal consumers?\b", evidence.text)
+    )
     broader = bool(
         evidence.file_refs >= 4
         or evidence.feature_signal
         or len(evidence.prose) > 6500
         or (platform_label and missing_reproduction)
+        or specialized_device_repro
+        or constrained_network_repro
+        or api_memory_tradeoff
         or (re.search(r"\bsuggested fix(?:es)?\b", evidence.text) and suggested_fix_bullets >= 3)
     )
     if broader:
@@ -367,6 +398,12 @@ def estimate_effort_details(
             reasons.append("multi-step suggested implementation")
         if platform_label and missing_reproduction:
             reasons.append("platform-specific reproduction is missing")
+        if specialized_device_repro:
+            reasons.append("specialized device reproduction/setup")
+        if constrained_network_repro:
+            reasons.append("constrained network reproduction/setup")
+        if api_memory_tradeoff:
+            reasons.append("API/interface change with explicit memory trade-off")
         return EffortEstimate("6–12h", tuple(reasons[:3]) or ("broader implementation scope",))
 
     if _trusted_history_complexity(activity_comments):
@@ -405,13 +442,28 @@ def estimate_effort_details(
             evidence.text[:4500],
         )
     )
-    bounded_bug = bounded_scope or deterministic_local_failure
-    if (localized_todo or bounded_bug) and len(evidence.prose) < 4500 and evidence.file_refs <= 2:
-        reason = (
-            "localized TODO/code-path change"
-            if localized_todo
-            else "bounded deterministic bug signal"
+    diagnosed_local_bug = bool(
+        evidence.file_refs == 1
+        and re.search(
+            r"\b(?:handles?|gets?)\s+this\s+correctly\b|"
+            r"\b(?:same|peer|existing)\s+(?:loop|code path|implementation)\b.{0,100}"
+            r"\b(?:correct|preferred|expected)\b",
+            evidence.text[:4500],
         )
+        and re.search(
+            r"\b(?:overwrit(?:e|es|ten)|drops?|silently|incorrectly|"
+            r"doesn't|does not|fails? to)\b",
+            evidence.text[:4500],
+        )
+    )
+    bounded_bug = bounded_scope or deterministic_local_failure or diagnosed_local_bug
+    if (localized_todo or bounded_bug) and len(evidence.prose) < 4500 and evidence.file_refs <= 2:
+        if localized_todo:
+            reason = "localized TODO/code-path change"
+        elif diagnosed_local_bug:
+            reason = "diagnosed one-file code-path fix"
+        else:
+            reason = "bounded deterministic bug signal"
         return EffortEstimate("1–3h", (reason,))
 
     return EffortEstimate("3–6h", ("moderate implementation scope",))

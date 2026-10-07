@@ -526,6 +526,46 @@ class SubmissionAndReporterResolutionTests(unittest.TestCase):
 
 
 class MaintainerIssueDecisionTests(unittest.TestCase):
+    def test_controller_runtime_maintainer_owned_followup_is_not_fresh_work(self) -> None:
+        controller_runtime = issue(
+            author_association="MEMBER",
+            body=(
+                "With a multiNamespaceCache it's not possible to retrieve the last "
+                "resourceVersion from the right underlying store. "
+                "We'll probably look into this when we make the ReadYourWritesConsistency "
+                "feature work with multiNamespaceCache/multiNamespaceInformer."
+            ),
+        )
+        self.assertEqual(
+            readiness.maintainer_issue_decision_reason(controller_runtime),
+            "maintainer-authored issue is planned as related project follow-up",
+        )
+
+    def test_future_ownership_requires_trusted_author_and_no_ready_override(self) -> None:
+        body = (
+            "We'll probably look into this when we make the consistency feature work "
+            "with the multi-namespace cache."
+        )
+        self.assertIsNone(
+            readiness.maintainer_issue_decision_reason(issue(author_association="NONE", body=body))
+        )
+        self.assertIsNone(
+            readiness.maintainer_issue_decision_reason(
+                issue(
+                    author_association="MEMBER",
+                    body=f"{body} Contributions welcome.",
+                )
+            )
+        )
+        self.assertIsNone(
+            readiness.maintainer_issue_decision_reason(
+                issue(
+                    author_association="MEMBER",
+                    body="We'll look into this soon. The implementation is otherwise defined.",
+                )
+            )
+        )
+
     def test_trusted_issue_author_can_mark_semantics_as_still_undecided(self) -> None:
         deciding = issue(
             author_association="MEMBER",
@@ -617,7 +657,192 @@ class RewardHistoryTests(unittest.TestCase):
         )
 
 
+class ReporterExternalInfrastructureTests(unittest.TestCase):
+    def test_moby_reporter_marks_external_flake_as_non_actionable(self) -> None:
+        moby = issue(user={"login": "GordonTheTurtle"})
+        comments: list[GitHubComment] = [
+            {
+                "user": {"login": "GordonTheTurtle"},
+                "body": (
+                    "Classification: still flaky — this is registry/network-side transient "
+                    "flakiness rather than something fixable in moby itself; no code fix is "
+                    "being attempted for this one."
+                ),
+            }
+        ]
+        self.assertEqual(
+            readiness.reporter_external_infrastructure_reason(moby, comments),
+            "issue reporter says failure is external infrastructure with no repository fix",
+        )
+
+    def test_external_flake_requires_reporter_and_explicit_no_fix_status(self) -> None:
+        item = issue(user={"login": "reporter"})
+        cases: tuple[tuple[list[GitHubComment], str], ...] = (
+            (
+                [{"user": {"login": "reporter"}, "body": "This looks like infra flakiness."}],
+                "missing no-fix status",
+            ),
+            (
+                [
+                    {
+                        "user": {"login": "someone-else"},
+                        "body": "It is infra flakiness; nothing we can fix really.",
+                    }
+                ],
+                "non-reporter status",
+            ),
+            (
+                [
+                    {
+                        "user": {"login": "reporter"},
+                        "body": "No code fix is being attempted while we redesign the API.",
+                    }
+                ],
+                "missing external-infra evidence",
+            ),
+        )
+        for comments, label in cases:
+            with self.subTest(label=label):
+                self.assertIsNone(readiness.reporter_external_infrastructure_reason(item, comments))
+
+    def test_latest_reporter_status_can_restore_actionability(self) -> None:
+        item = issue(user={"login": "reporter"})
+        comments: list[GitHubComment] = [
+            {
+                "user": {"login": "reporter"},
+                "body": (
+                    "This is external infrastructure flakiness; no code fix is being attempted."
+                ),
+            },
+            {
+                "user": {"login": "someone-else"},
+                "body": "I agree it looks external.",
+            },
+            {
+                "user": {"login": "reporter"},
+                "body": (
+                    "We found a repository-side retry bug after all. "
+                    "The implementation is now ready."
+                ),
+            },
+        ]
+        self.assertIsNone(readiness.reporter_external_infrastructure_reason(item, comments))
+
+    def test_missing_reporter_or_reporter_comments_is_not_rejected(self) -> None:
+        self.assertIsNone(
+            readiness.reporter_external_infrastructure_reason(
+                issue(user={}),
+                [{"user": {"login": "someone"}, "body": "Infra flakiness; nothing we can fix."}],
+            )
+        )
+        self.assertIsNone(
+            readiness.reporter_external_infrastructure_reason(
+                issue(user={"login": "reporter"}),
+                [{"user": {"login": "someone"}, "body": "Infra flakiness; nothing we can fix."}],
+            )
+        )
+
+
 class ReporterSupportTriageTests(unittest.TestCase):
+    def test_moby_lifecycle_planning_issue_is_not_implementation_ready(self) -> None:
+        moby = issue(
+            title="extpoints/storage: Figure out lifecycle / gc",
+            body=(
+                "We need a plan for the lifecycle / bookkeeping of this data.\n\n"
+                "What if an extension doesn't properly cleanup, and when is it safe to purge? "
+                "We probably can't unconditionally purge data if an extension is missing during "
+                "startup, but we also won't know if the extension is temporarily missing or "
+                "uninstalled."
+            ),
+        )
+        self.assertEqual(
+            readiness.reporter_support_triage_reason(moby),
+            "reporter issue is still defining design/lifecycle semantics",
+        )
+
+    def test_generic_investigation_and_defined_lifecycle_work_remain_actionable(self) -> None:
+        actionable = (
+            issue(
+                title="Figure out why the parser crashes",
+                body=(
+                    "The crash reproduces with this fixture. Update parseHeader and add a "
+                    "regression test."
+                ),
+            ),
+            issue(
+                title="Implement storage lifecycle cleanup",
+                body=(
+                    "Implementation plan: remove orphaned records after the extension is "
+                    "confirmed uninstalled. Add unit tests for the cleanup path."
+                ),
+            ),
+            issue(
+                title="Storage lifecycle edge case",
+                body=(
+                    "We need a plan for the migration rollout. What if an old record remains? "
+                    "The implementation is already defined in the migration helper."
+                ),
+            ),
+        )
+        for item in actionable:
+            with self.subTest(title=item.get("title")):
+                self.assertIsNone(readiness.reporter_support_triage_reason(item))
+
+    def test_terraform_reporter_waiting_for_design_review_is_not_ready(self) -> None:
+        terraform = issue(
+            body=(
+                "PR #39328 explored a targeted instance lookup and was closed before technical "
+                "review because the required proposal discussion had not happened first.\n\n"
+                "Before another implementation PR, would the Terraform Core maintainers be open "
+                "to reviewing a narrowly-scoped optimization? If this is not the right direction, "
+                "guidance on the preferred design or whether this case is in scope would be "
+                "appreciated."
+            )
+        )
+        self.assertEqual(
+            readiness.reporter_support_triage_reason(terraform),
+            "reporter is awaiting maintainer design approval before implementation",
+        )
+
+    def test_flux_configuration_guidance_request_is_support_not_implementation(self) -> None:
+        flux = issue(
+            body=(
+                "We are encountering an issue because the Vault URL operates over HTTPS. "
+                "We are seeking guidance on how to add our custom CA certificate to the "
+                "kustomize-controller. Your assistance in resolving this matter would be "
+                "greatly appreciated."
+            )
+        )
+        self.assertEqual(
+            readiness.reporter_support_triage_reason(flux),
+            "support/triage issue rather than a contributor task",
+        )
+
+    def test_pre_pr_workflow_instruction_does_not_imply_approval_gate(self) -> None:
+        self.assertIsNone(
+            readiness.reporter_support_triage_reason(
+                issue(
+                    body=(
+                        "The implementation is defined: update the parser and add regression tests. "
+                        "Before an implementation PR, run the focused unit tests locally."
+                    )
+                )
+            )
+        )
+
+    def test_guidance_wording_with_explicit_implementation_remains_actionable(self) -> None:
+        self.assertIsNone(
+            readiness.reporter_support_triage_reason(
+                issue(
+                    body=(
+                        "Implement retries for reusable request bodies. The code path is known and "
+                        "the regression test is specified. Guidance for users should be added to "
+                        "the documentation after the fix."
+                    )
+                )
+            )
+        )
+
     def test_guidance_questionnaire_is_support_triage_not_implementation(self) -> None:
         support = issue(
             body=(

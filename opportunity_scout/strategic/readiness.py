@@ -147,6 +147,16 @@ _REPORTER_RESOLVED_MARKERS: Final = (
     "can't reproduce anymore",
     "cannot reproduce anymore",
 )
+_REPORTER_EXTERNAL_INFRA_RE: Final = re.compile(
+    r"\b(?:infra(?:structure)?\s+flakiness|external\s+infrastructure|"
+    r"registry/network-side\s+transient\s+flakiness|network-side\s+transient\s+flakiness)\b",
+    re.IGNORECASE,
+)
+_REPORTER_NO_CODE_FIX_RE: Final = re.compile(
+    r"\bno\s+code\s+fix\s+is\s+being\s+attempted\b|"
+    r"\bnothing\s+we\s+can\s+fix(?:\s+really)?\b",
+    re.IGNORECASE,
+)
 _PAYOUT_SUMMARY_MARKERS: Final = (
     "total bounty distributed",
     "top contributors",
@@ -207,12 +217,40 @@ _DECISION_STAGE_RE: Final = re.compile(
     r"\bwe (?:still )?need to decide\b|"
     r"\bdecision (?:is|remains) (?:open|pending)\b"
 )
+_MAINTAINER_FUTURE_OWNERSHIP_RE: Final = re.compile(
+    r"\bwe(?:'ll| will)\s+(?:probably\s+)?look\s+into\s+this\s+when\s+we\s+"
+    r"(?:make|implement|add|land|finish)\b",
+    re.IGNORECASE,
+)
 _SUBMISSION_CLOSED_RE: Final = re.compile(
     r"\b(?:a |the )?(?:pr|pull request).{0,80}\bwill be closed\b",
     re.DOTALL,
 )
 _SUPPORT_QUESTION_RE: Final = re.compile(
     r"(?m)^\s*\d+\.\s+(?:is|are|could|would|should|can|do|does)\b.*\?\s*$",
+    re.IGNORECASE,
+)
+_REPORTER_GUIDANCE_REQUEST_RE: Final = re.compile(
+    r"\b(?:seeking|looking for|requesting)\s+guidance\s+(?:on|about|for)\b"
+    r".{0,180}\b(?:how\s+to|configur(?:e|ation)|use|using|supply|provide|add|set\s*up)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_REPORTER_IMPLEMENTATION_APPROVAL_RE: Final = re.compile(
+    r"\bbefore\s+(?:another\s+|an?\s+)?(?:implementation\s+)?(?:pr|pull request)\b"
+    r".{0,260}\b(?:maintainers?\b.{0,100}\b(?:review|approve)|"
+    r"guidance\b.{0,100}\b(?:design|scope|direction)|"
+    r"(?:preferred|right)\s+(?:design|approach|direction))\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_REPORTER_DESIGN_PLANNING_RE: Final = re.compile(
+    r"\b(?:we\s+)?need\s+a\s+plan\s+for\b|"
+    r"\bfigure\s+out\s+(?:the\s+)?(?:lifecycle|gc|garbage collection|"
+    r"bookkeeping|ownership|semantics)\b",
+    re.IGNORECASE,
+)
+_REPORTER_DESIGN_QUESTION_RE: Final = re.compile(
+    r"\b(?:what if|when is it safe|how should|who should|should we|"
+    r"whether we should|won't know|will not know)\b",
     re.IGNORECASE,
 )
 _TRACKING_CONTAINER_RE: Final = re.compile(
@@ -519,12 +557,18 @@ def abandoned_lifecycle_reason(
 
 
 def maintainer_issue_decision_reason(item: GitHubIssue) -> str | None:
-    """Reject trusted maintainer-authored issues that explicitly remain in decision stage."""
+    """Reject trusted maintainer-authored issues that remain unready or project-owned."""
     evidence = _issue_evidence(item)
     if evidence.author_association not in TRUSTED_ASSOCIATIONS:
         return None
+
+    body = evidence.normalized_body_lower
+    if _explicit_ready_signal(body):
+        return None
     if _DECISION_STAGE_RE.search(evidence.body_lower):
         return "maintainer-authored issue is still deciding implementation semantics"
+    if _MAINTAINER_FUTURE_OWNERSHIP_RE.search(body):
+        return "maintainer-authored issue is planned as related project follow-up"
     return None
 
 
@@ -547,6 +591,29 @@ def maintainer_submission_hold_reason(item: GitHubIssue) -> str | None:
         ),
     ) or _SUBMISSION_CLOSED_RE.search(body):
         return "maintainer explicitly says not to open a PR for this issue"
+    return None
+
+
+def reporter_external_infrastructure_reason(
+    item: GitHubIssue,
+    comments: list[GitHubComment] | None,
+) -> str | None:
+    """Reject when the reporter's latest status says the failure is external and has no code fix."""
+    reporter = _issue_evidence(item).reporter_login
+    if not reporter:
+        return None
+
+    reporter_comments = [
+        _comment_evidence(comment)
+        for comment in comments or []
+        if _comment_evidence(comment).login == reporter
+    ]
+    if not reporter_comments:
+        return None
+
+    latest = reporter_comments[-1].normalized_body_lower
+    if _REPORTER_EXTERNAL_INFRA_RE.search(latest) and _REPORTER_NO_CODE_FIX_RE.search(latest):
+        return "issue reporter says failure is external infrastructure with no repository fix"
     return None
 
 
@@ -601,14 +668,30 @@ def reward_history_reason(item: GitHubIssue) -> str | None:
 
 
 def reporter_support_triage_reason(item: GitHubIssue) -> str | None:
-    """Reject reporter-authored diagnostic/support requests without defined implementation."""
+    """Reject reporter-authored support or unresolved pre-implementation planning."""
     evidence = _issue_evidence(item)
+    body = evidence.normalized_body_lower
+
+    if _REPORTER_IMPLEMENTATION_APPROVAL_RE.search(body):
+        return "reporter is awaiting maintainer design approval before implementation"
+
+    design_planning_text = f"{evidence.title}\n{evidence.body}"
+    if (
+        _REPORTER_DESIGN_PLANNING_RE.search(design_planning_text)
+        and len(_REPORTER_DESIGN_QUESTION_RE.findall(body)) >= 2
+    ):
+        return "reporter issue is still defining design/lifecycle semantics"
+
     guidance_request = (
-        "would like to determine whether" in evidence.normalized_body_lower
-        or "would particularly appreciate guidance" in evidence.normalized_body_lower
-        or "would appreciate guidance" in evidence.normalized_body_lower
+        "would like to determine whether" in body
+        or "would particularly appreciate guidance" in body
+        or "would appreciate guidance" in body
     )
-    if guidance_request and len(_SUPPORT_QUESTION_RE.findall(evidence.body)) >= 3:
+    if (
+        guidance_request
+        and len(_SUPPORT_QUESTION_RE.findall(evidence.body)) >= 3
+        or _REPORTER_GUIDANCE_REQUEST_RE.search(body)
+    ):
         return "support/triage issue rather than a contributor task"
     return None
 

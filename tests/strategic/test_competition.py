@@ -369,6 +369,123 @@ class CanonicalIssueReferenceTests(unittest.TestCase):
             "t",
         )
 
+    def test_cilium_contributor_duplicate_redirect_verifies_open_canonical_issue(self) -> None:
+        item = issue(html_url="https://github.com/cilium/cilium/issues/47400", body="")
+        comments: list[GitHubComment] = [
+            {
+                "author_association": "CONTRIBUTOR",
+                "body": (
+                    "I should note that it seems likely that this is a duplicate of #46260; "
+                    "it may be more fruitful to move discussion to there."
+                ),
+            }
+        ]
+        with patch.object(
+            github,
+            "github_get",
+            return_value={
+                "state": "open",
+                "html_url": "https://github.com/cilium/cilium/issues/46260",
+            },
+        ) as getter:
+            self.assertEqual(
+                competition.canonical_open_issue_reason(item, "t", comments),
+                (
+                    "same work is already tracked by open canonical issue: "
+                    "https://github.com/cilium/cilium/issues/46260"
+                ),
+            )
+        getter.assert_called_once_with(
+            "https://api.github.com/repos/cilium/cilium/issues/46260",
+            "t",
+        )
+
+    def test_comment_duplicate_redirect_requires_authority_redirect_and_open_target(self) -> None:
+        item = issue(body="")
+        cases: tuple[tuple[GitHubComment, bool], ...] = (
+            (
+                {
+                    "author_association": "NONE",
+                    "body": "This seems likely a duplicate of #17; move discussion to there.",
+                },
+                False,
+            ),
+            (
+                {
+                    "author_association": "CONTRIBUTOR",
+                    "body": "This seems likely a duplicate of #17.",
+                },
+                False,
+            ),
+            (
+                {
+                    "author_association": "CONTRIBUTOR",
+                    "body": "This is not a duplicate of #17; move discussion to there.",
+                },
+                False,
+            ),
+        )
+        for candidate_comment, should_fetch in cases:
+            with (
+                self.subTest(comment=candidate_comment),
+                patch.object(github, "github_get") as getter,
+            ):
+                self.assertIsNone(
+                    competition.canonical_open_issue_reason(item, "t", [candidate_comment])
+                )
+            self.assertEqual(getter.called, should_fetch)
+
+        with patch.object(
+            github,
+            "github_get",
+            return_value={"state": "closed"},
+        ) as getter:
+            self.assertIsNone(
+                competition.canonical_open_issue_reason(
+                    item,
+                    "t",
+                    [
+                        {
+                            "author_association": "MEMBER",
+                            "body": (
+                                "It appears this is a duplicate of #17; "
+                                "please move discussion to there."
+                            ),
+                        }
+                    ],
+                )
+            )
+        getter.assert_called_once_with(
+            "https://api.github.com/repos/example/project/issues/17",
+            "t",
+        )
+
+    def test_comment_canonical_references_skip_self_and_dedupe_body_target(self) -> None:
+        item = issue(body="The canonical issue #17 tracks this feature already.")
+        comments: list[GitHubComment] = [
+            {
+                "author_association": "CONTRIBUTOR",
+                "body": ("It appears this is a duplicate of #42; move discussion to there."),
+            },
+            {
+                "author_association": "MEMBER",
+                "body": (
+                    "It appears this is a duplicate of #17; move discussion to there. "
+                    "#17 is the target."
+                ),
+            },
+        ]
+        with patch.object(
+            github,
+            "github_get",
+            return_value={"state": "closed"},
+        ) as getter:
+            self.assertIsNone(competition.canonical_open_issue_reason(item, "t", comments))
+        getter.assert_called_once_with(
+            "https://api.github.com/repos/example/project/issues/17",
+            "t",
+        )
+
     def test_canonical_issue_shorthand_is_verified_and_closed_target_is_allowed(self) -> None:
         item = issue(
             body="The canonical issue #17 tracks this feature already.",
@@ -504,6 +621,66 @@ class LinkedPullRequestTests(unittest.TestCase):
                 competition.linked_open_pr_reason(issue(), "t", same_repo),
                 "existing open implementation PR: https://github.com/example/project/pull/13",
             )
+
+    def test_tailscale_issue_body_rejects_merged_linked_implementation(self) -> None:
+        item = issue(
+            html_url="https://github.com/tailscale/tailscale/issues/21617",
+            comments=0,
+            body=(
+                "Opt-out patch and tests. Want a local opt-out so people without permissions "
+                "can opt out. https://github.com/tailscale/tailscale/pull/21616"
+            ),
+        )
+        with patch.object(
+            github,
+            "github_get",
+            return_value={
+                "state": "closed",
+                "merged": True,
+                "html_url": "https://github.com/tailscale/tailscale/pull/21616",
+            },
+        ) as getter:
+            self.assertEqual(
+                competition.linked_open_pr_reason(item, "t", []),
+                (
+                    "linked implementation PR is already merged: "
+                    "https://github.com/tailscale/tailscale/pull/21616"
+                ),
+            )
+        getter.assert_called_once_with(
+            "https://api.github.com/repos/tailscale/tailscale/pulls/21616",
+            "t",
+        )
+
+    def test_closed_unmerged_and_generic_merged_comment_links_remain_available(self) -> None:
+        item = issue(
+            comments=0,
+            body=("Implementation patch: https://github.com/example/project/pull/13"),
+        )
+        with patch.object(
+            github,
+            "github_get",
+            return_value={
+                "state": "closed",
+                "merged": False,
+                "html_url": "https://github.com/example/project/pull/13",
+            },
+        ):
+            self.assertIsNone(competition.linked_open_pr_reason(item, "t", []))
+
+        comments: list[GitHubComment] = [
+            {"body": "See https://github.com/example/project/pull/14 for related context."}
+        ]
+        with patch.object(
+            github,
+            "github_get",
+            return_value={
+                "state": "closed",
+                "merged": True,
+                "html_url": "https://github.com/example/project/pull/14",
+            },
+        ):
+            self.assertIsNone(competition.linked_open_pr_reason(issue(), "t", comments))
 
     def test_linked_pr_detects_implementation_link_in_issue_body_without_comments(self) -> None:
         item = issue(
