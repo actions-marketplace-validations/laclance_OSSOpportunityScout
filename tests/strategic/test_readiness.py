@@ -525,6 +525,168 @@ class SubmissionAndReporterResolutionTests(unittest.TestCase):
                 )
 
 
+class MaintainerCurrentBehaviorTests(unittest.TestCase):
+    def test_moby_current_default_save_load_preserves_digest(self) -> None:
+        moby = issue(
+            title="Digest is lost after loading a saved image",
+            body=(
+                "Save image with docker save, delete it, then load it again. "
+                "The digest disappears after docker load."
+            ),
+        )
+        comments: list[GitHubComment] = [
+            {
+                "author_association": "MEMBER",
+                "body": (
+                    "Do you have the containerd image store enabled, which is now the default "
+                    "for new installations? Save the image, then delete, and load it again. "
+                    "After loading; digests are the same."
+                ),
+            }
+        ]
+
+        self.assertEqual(
+            readiness.maintainer_current_behavior_reason(moby, comments),
+            "trusted maintainer demonstrates current default behavior already resolves issue",
+        )
+
+    def test_current_behavior_resolution_requires_trusted_full_proof(self) -> None:
+        item = issue(
+            body="Save the image, load it, and compare the digest.",
+        )
+        cases: tuple[GitHubComment, ...] = (
+            {
+                "author_association": "NONE",
+                "body": (
+                    "The containerd image store is now the default for new installations. "
+                    "Save the image, load it again. After loading; digests are the same."
+                ),
+            },
+            {
+                "author_association": "MEMBER",
+                "body": (
+                    "With the optional containerd image store, save the image, load it again. "
+                    "After loading; digests are the same."
+                ),
+            },
+            {
+                "author_association": "MEMBER",
+                "body": (
+                    "The containerd image store is now the default for new installations. "
+                    "Please try save and load and report whether the digest changes."
+                ),
+            },
+        )
+        for candidate_comment in cases:
+            with self.subTest(body=candidate_comment["body"]):
+                self.assertIsNone(
+                    readiness.maintainer_current_behavior_reason(item, [candidate_comment])
+                )
+
+        self.assertIsNone(
+            readiness.maintainer_current_behavior_reason(
+                issue(body="Parser crash after restart."),
+                [
+                    {
+                        "author_association": "MEMBER",
+                        "body": (
+                            "The new parser is now the default for new installations. "
+                            "Save the image, load it again. After loading; digests are the same."
+                        ),
+                    }
+                ],
+            )
+        )
+
+
+class MaintainerOpenIdeaTests(unittest.TestCase):
+    def test_controller_runtime_unsettled_maintainer_idea_is_not_ready(self) -> None:
+        controller_runtime = issue(
+            author_association="MEMBER",
+            body=(
+                "The metrics server can take a few seconds to become available.\n\n"
+                "### Just an Idea\n\n"
+                "It might be nice if controller-runtime could provide a ReadyzCheck."
+            ),
+        )
+        comments: list[GitHubComment] = [
+            {
+                "author_association": "MEMBER",
+                "body": (
+                    "Not sure if a controller should be not ready because "
+                    "the metrics server is not up yet."
+                ),
+            },
+            {
+                "author_association": "MEMBER",
+                "body": (
+                    "But maybe it's fine to implement something similar for the metrics server. "
+                    "@another-maintainer Do you have an opinion on this?"
+                ),
+            },
+        ]
+
+        self.assertEqual(
+            readiness.maintainer_open_idea_reason(controller_runtime, comments),
+            "maintainer-authored idea still needs implementation decision",
+        )
+
+    def test_unsettled_idea_requires_trusted_author_heading_and_full_discussion(self) -> None:
+        comments: list[GitHubComment] = [
+            {
+                "author_association": "NONE",
+                "body": "Not sure if the controller should expose this. Do you have an opinion?",
+            },
+            {
+                "author_association": "MEMBER",
+                "body": "Not sure if the controller should expose this.",
+            },
+            {
+                "author_association": "MEMBER",
+                "body": "Do you have an opinion on this?",
+            },
+        ]
+        self.assertIsNone(
+            readiness.maintainer_open_idea_reason(
+                issue(author_association="NONE", body="### Just an Idea\nMaybe add this."),
+                comments,
+            )
+        )
+        self.assertIsNone(
+            readiness.maintainer_open_idea_reason(
+                issue(author_association="MEMBER", body="Implement the metrics readiness check."),
+                comments,
+            )
+        )
+        self.assertIsNone(
+            readiness.maintainer_open_idea_reason(
+                issue(author_association="MEMBER", body="### Just an Idea\nMaybe add this."),
+                comments[:1],
+            )
+        )
+
+    def test_later_maintainer_ready_signal_restores_actionability(self) -> None:
+        item = issue(
+            author_association="MEMBER",
+            body="### Just an Idea\nMaybe expose this readiness check.",
+        )
+        comments: list[GitHubComment] = [
+            {
+                "author_association": "MEMBER",
+                "body": "Not sure if the controller should expose this.",
+            },
+            {
+                "author_association": "MEMBER",
+                "body": "Do you have an opinion on this?",
+            },
+            {
+                "author_association": "MEMBER",
+                "body": "The design is settled. Contributions welcome.",
+            },
+        ]
+        self.assertIsNone(readiness.maintainer_open_idea_reason(item, comments))
+
+
 class MaintainerIssueDecisionTests(unittest.TestCase):
     def test_controller_runtime_maintainer_owned_followup_is_not_fresh_work(self) -> None:
         controller_runtime = issue(
@@ -655,6 +817,81 @@ class RewardHistoryTests(unittest.TestCase):
                 )
             )
         )
+
+
+class ReporterDesignDiscussionTests(unittest.TestCase):
+    def test_opentelemetry_reporter_open_design_discussion_is_not_ready(self) -> None:
+        item = issue(
+            user={"login": "trentm"},
+            body=(
+                "It isn't obvious to me how best to pass default_histogram_aggregation. "
+                "Is having an aggregationPreference argument reasonable? "
+                "Would it be better to have both exporters accept the same option? "
+                "Do we need a breaking change to sdk-metrics?"
+            ),
+        )
+        comments: list[GitHubComment] = [
+            {
+                "user": {"login": "trentm"},
+                "body": (
+                    "There is still open discussion on what the config options to "
+                    "ConsoleMetricExporter should be and where the preference should live."
+                ),
+            }
+        ]
+
+        self.assertEqual(
+            readiness.reporter_design_discussion_reason(item, comments),
+            "issue reporter says implementation design is still under discussion",
+        )
+
+    def test_open_design_discussion_requires_reporter_and_multiple_choices(self) -> None:
+        item = issue(
+            user={"login": "reporter"},
+            body=(
+                "Would it be better to rename this option? "
+                "The implementation otherwise has a defined code path."
+            ),
+        )
+        self.assertIsNone(
+            readiness.reporter_design_discussion_reason(
+                item,
+                [
+                    {
+                        "user": {"login": "someone-else"},
+                        "body": "There is still open discussion about this design.",
+                    }
+                ],
+            )
+        )
+        self.assertIsNone(
+            readiness.reporter_design_discussion_reason(
+                item,
+                [
+                    {
+                        "user": {"login": "reporter"},
+                        "body": "There is still open discussion about this design.",
+                    }
+                ],
+            )
+        )
+
+    def test_latest_reporter_ready_signal_restores_actionability(self) -> None:
+        item = issue(
+            user={"login": "reporter"},
+            body=("Would it be better to share the selector? Do we need to move the enum first?"),
+        )
+        comments: list[GitHubComment] = [
+            {
+                "user": {"login": "reporter"},
+                "body": "There is still open discussion about the implementation.",
+            },
+            {
+                "user": {"login": "reporter"},
+                "body": "The design is settled now; ready for implementation.",
+            },
+        ]
+        self.assertIsNone(readiness.reporter_design_discussion_reason(item, comments))
 
 
 class ReporterExternalInfrastructureTests(unittest.TestCase):

@@ -222,6 +222,28 @@ _MAINTAINER_FUTURE_OWNERSHIP_RE: Final = re.compile(
     r"(?:make|implement|add|land|finish)\b",
     re.IGNORECASE,
 )
+_MAINTAINER_IDEA_HEADING_RE: Final = re.compile(
+    r"(?m)^\s*#{1,6}\s+just\s+an\s+idea\s*$",
+    re.IGNORECASE,
+)
+_MAINTAINER_IDEA_UNCERTAINTY_RE: Final = re.compile(
+    r"\bnot\s+sure\s+if\b.{0,180}\bshould\b|"
+    r"\bmaybe\s+(?:it(?:'s| is)|this(?: is)?)\s+fine\s+to\s+implement\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_MAINTAINER_OPINION_REQUEST_RE: Final = re.compile(
+    r"\bdo\s+you\s+have\s+an\s+opinion\s+on\s+this\b",
+    re.IGNORECASE,
+)
+_MAINTAINER_CURRENT_DEFAULT_RE: Final = re.compile(
+    r"\bnow\s+the\s+default\s+for\s+new\s+installations\b",
+    re.IGNORECASE,
+)
+_MAINTAINER_SAVE_LOAD_RESOLUTION_RE: Final = re.compile(
+    r"\bsave\s+the\s+image\b.{0,1200}\bload\s+it\s+again\b"
+    r".{0,1200}\bafter\s+loading\b.{0,120}\bdigests?\s+are\s+the\s+same\b",
+    re.IGNORECASE | re.DOTALL,
+)
 _SUBMISSION_CLOSED_RE: Final = re.compile(
     r"\b(?:a |the )?(?:pr|pull request).{0,80}\bwill be closed\b",
     re.DOTALL,
@@ -252,6 +274,16 @@ _REPORTER_DESIGN_QUESTION_RE: Final = re.compile(
     r"\b(?:what if|when is it safe|how should|who should|should we|"
     r"whether we should|won't know|will not know)\b",
     re.IGNORECASE,
+)
+_REPORTER_OPEN_DESIGN_RE: Final = re.compile(
+    r"\bstill\s+open\s+discussion\b",
+    re.IGNORECASE,
+)
+_REPORTER_IMPLEMENTATION_CHOICE_RE: Final = re.compile(
+    r"\b(?:it\s+isn['’]t\s+obvious\s+to\s+me\s+how\s+best|"
+    r"is\s+having\b.{0,140}\breasonable|would\s+it\s+be\s+better|"
+    r"do\s+we\s+need|should\s+(?:the|this|we)\b|what\s+happens\s+when)\b",
+    re.IGNORECASE | re.DOTALL,
 )
 _TRACKING_CONTAINER_RE: Final = re.compile(
     r"\b(?:use|using)\s+(?:this|the)\s+issue\s+for\s+tracking\b"
@@ -572,6 +604,61 @@ def maintainer_issue_decision_reason(item: GitHubIssue) -> str | None:
     return None
 
 
+def maintainer_current_behavior_reason(
+    item: GitHubIssue,
+    comments: list[GitHubComment] | None,
+) -> str | None:
+    """Reject when a trusted maintainer proves the current default behavior resolves the issue."""
+    issue_text = _issue_evidence(item).normalized_body_lower
+    if not all(marker in issue_text for marker in ("save", "load", "digest")):
+        return None
+
+    for comment in comments or []:
+        evidence = _comment_evidence(comment)
+        if evidence.author_association not in TRUSTED_ASSOCIATIONS:
+            continue
+
+        body = evidence.normalized_body_lower
+        if _MAINTAINER_CURRENT_DEFAULT_RE.search(
+            body
+        ) and _MAINTAINER_SAVE_LOAD_RESOLUTION_RE.search(body):
+            return "trusted maintainer demonstrates current default behavior already resolves issue"
+    return None
+
+
+def maintainer_open_idea_reason(
+    item: GitHubIssue,
+    comments: list[GitHubComment] | None,
+) -> str | None:
+    """Reject maintainer-authored ideas while trusted maintainers are still deciding."""
+    evidence = _issue_evidence(item)
+    if evidence.author_association not in TRUSTED_ASSOCIATIONS:
+        return None
+    if _MAINTAINER_IDEA_HEADING_RE.search(evidence.body) is None:
+        return None
+
+    uncertain = False
+    opinion_requested = False
+    for comment in comments or []:
+        comment_evidence = _comment_evidence(comment)
+        if comment_evidence.author_association not in TRUSTED_ASSOCIATIONS:
+            continue
+
+        body = comment_evidence.normalized_body_lower
+        if _explicit_ready_signal(body):
+            uncertain = False
+            opinion_requested = False
+            continue
+        if _MAINTAINER_IDEA_UNCERTAINTY_RE.search(body):
+            uncertain = True
+        if _MAINTAINER_OPINION_REQUEST_RE.search(body):
+            opinion_requested = True
+
+    if uncertain and opinion_requested:
+        return "maintainer-authored idea still needs implementation decision"
+    return None
+
+
 def maintainer_submission_hold_reason(item: GitHubIssue) -> str | None:
     """Reject trusted maintainer-authored issues that explicitly tell contributors not to PR."""
     evidence = _issue_evidence(item)
@@ -591,6 +678,35 @@ def maintainer_submission_hold_reason(item: GitHubIssue) -> str | None:
         ),
     ) or _SUBMISSION_CLOSED_RE.search(body):
         return "maintainer explicitly says not to open a PR for this issue"
+    return None
+
+
+def reporter_design_discussion_reason(
+    item: GitHubIssue,
+    comments: list[GitHubComment] | None,
+) -> str | None:
+    """Reject when the reporter says multiple implementation choices remain under discussion."""
+    evidence = _issue_evidence(item)
+    reporter = evidence.reporter_login
+    if not reporter:
+        return None
+
+    reporter_comments = [
+        _comment_evidence(comment)
+        for comment in comments or []
+        if _comment_evidence(comment).login == reporter
+    ]
+    if not reporter_comments:
+        return None
+
+    latest = reporter_comments[-1].normalized_body_lower
+    if _explicit_ready_signal(latest):
+        return None
+    if (
+        _REPORTER_OPEN_DESIGN_RE.search(latest)
+        and len(_REPORTER_IMPLEMENTATION_CHOICE_RE.findall(evidence.normalized_body_lower)) >= 2
+    ):
+        return "issue reporter says implementation design is still under discussion"
     return None
 
 
