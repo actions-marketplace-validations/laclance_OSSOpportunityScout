@@ -1265,6 +1265,130 @@ class ScoringRegressionTests(unittest.TestCase):
         self.assertIn("recent maintainer activity", result["career_reasons"])
         self.assertNotIn("stale inactive backlog penalty", result["career_reasons"])
 
+    def test_report_13_external_self_promotion_does_not_revive_flux_issue(self) -> None:
+        now = datetime.now(timezone.utc)
+        promo_time = now - timedelta(days=16)
+        result = scoring.build_candidate(
+            issue(
+                html_url="https://github.com/fluxcd/flux2/issues/1420",
+                title='Bootstrap with multiple SSH keys loaded returns "Too many authentication failures"',
+                body="Flux does not honor the configured SSH identity during bootstrap.",
+                comments=3,
+                created_at=(now - timedelta(days=1960)).isoformat(),
+                updated_at=promo_time.isoformat(),
+            ),
+            "strategic",
+            None,
+            repo_meta(),
+            None,
+            [
+                {
+                    "created_at": (now - timedelta(days=1500)).isoformat(),
+                    "author_association": "NONE",
+                    "user": {"login": "earlier-user"},
+                    "body": "We see this too when users have many SSH keys.",
+                },
+                {
+                    "created_at": promo_time.isoformat(),
+                    "updated_at": promo_time.isoformat(),
+                    "author_association": "NONE",
+                    "user": {"login": "tool-author"},
+                    "body": (
+                        "For anyone still hitting this problem, I built kmux as a workaround. "
+                        "I maintain the project: https://github.com/example/kmux. "
+                        "This doesn't fix Flux itself."
+                    ),
+                },
+            ],
+            target_repos={"fluxcd/flux2"},
+            amount_pattern=AMOUNT_RE,
+        )
+
+        self.assertNotIn("issue active in last 60d", result["career_reasons"])
+        self.assertNotIn("recent active discussion", result["career_reasons"])
+        self.assertIn("stale inactive backlog penalty", result["career_reasons"])
+
+    def test_external_links_and_normal_workarounds_still_count_as_activity(self) -> None:
+        now = datetime.now(timezone.utc)
+        self.assertFalse(
+            scoring._external_self_promotion_comment(
+                issue(html_url="not-a-github-issue"),
+                cast(
+                    GitHubComment,
+                    {
+                        "body": (
+                            "I built https://github.com/example/helper as a workaround. "
+                            "This does not fix the original project."
+                        ),
+                        "author_association": "NONE",
+                    },
+                ),
+            )
+        )
+        recent = now - timedelta(days=5)
+        cases: tuple[GitHubComment, ...] = (
+            {
+                "body": (
+                    "I reproduced this and documented logs in "
+                    "https://github.com/example/diagnostics."
+                ),
+                "author_association": "NONE",
+                "user": {"login": "user"},
+            },
+            {
+                "body": "This workaround avoids unloading every key while the bug is fixed.",
+                "author_association": "NONE",
+                "user": {"login": "user"},
+            },
+            {
+                "body": (
+                    "I maintain https://github.com/example/helper and this also reproduces "
+                    "the underlying Flux bug."
+                ),
+                "author_association": "NONE",
+                "user": {"login": "user"},
+            },
+            {
+                "body": (
+                    "I built https://github.com/example/helper as a workaround while we "
+                    "investigate this."
+                ),
+                "author_association": "MEMBER",
+                "user": {"login": "maintainer"},
+            },
+        )
+        for comment_data in cases:
+            with self.subTest(body=comment_data["body"]):
+                activity_comment: GitHubComment = {
+                    **comment_data,
+                    "created_at": recent.isoformat(),
+                    "updated_at": recent.isoformat(),
+                }
+                result = scoring.build_candidate(
+                    issue(
+                        html_url="https://github.com/fluxcd/flux2/issues/1420",
+                        title="SSH bootstrap bug",
+                        body="Bootstrap fails with multiple keys.",
+                        created_at=(now - timedelta(days=800)).isoformat(),
+                        updated_at=recent.isoformat(),
+                        comments=1,
+                    ),
+                    "strategic",
+                    None,
+                    repo_meta(),
+                    None,
+                    [activity_comment],
+                    target_repos={"fluxcd/flux2"},
+                    amount_pattern=AMOUNT_RE,
+                )
+                expected_reason = (
+                    "recent maintainer activity"
+                    if str(comment_data.get("author_association", "")).upper()
+                    in {"OWNER", "MEMBER", "COLLABORATOR"}
+                    else "recent active discussion"
+                )
+                self.assertIn(expected_reason, result["career_reasons"])
+
     def test_bot_only_activity_does_not_revive_old_issue(self) -> None:
         now = datetime.now(timezone.utc)
         bot_time = now - timedelta(days=12)
