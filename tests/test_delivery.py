@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import io
 import json
+import urllib.error
 import urllib.request
+from collections.abc import Callable
+from contextlib import redirect_stdout
 from typing import Any, cast
 import unittest
 from unittest.mock import patch
@@ -19,7 +23,31 @@ def request_json(req: urllib.request.Request) -> dict[str, Any]:
     return cast(dict[str, Any], loaded)
 
 
+def github_open_via_urlopen(
+    request: urllib.request.Request,
+    *,
+    timeout: int,
+) -> Any:
+    return urllib.request.urlopen(request, timeout=timeout)
+
+
+REAL_GITHUB_MUTATION_OPEN = delivery._github_mutation_open
+
+
 class DeliveryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        read_patcher = patch.object(github, "_github_open", side_effect=github_open_via_urlopen)
+        read_patcher.start()
+        self.addCleanup(read_patcher.stop)
+
+        mutation_patcher = patch.object(
+            delivery,
+            "_github_mutation_open",
+            side_effect=github_open_via_urlopen,
+        )
+        mutation_patcher.start()
+        self.addCleanup(mutation_patcher.stop)
+
     def test_telegram_success_preserves_request(self) -> None:
         with patch.object(
             urllib.request,
@@ -67,6 +95,110 @@ class DeliveryTests(unittest.TestCase):
         with patch.object(urllib.request, "urlopen", side_effect=OSError("discord failed")):
             self.assertFalse(delivery.send_discord_notification("https://hook", "hello"))
 
+    def test_notification_failures_do_not_expose_credentials(self) -> None:
+        cases: tuple[tuple[Callable[[], bool], str], ...] = (
+            (
+                lambda: delivery.send_telegram_notification("secret-token", "chat", "hello"),
+                "secret-token",
+            ),
+            (
+                lambda: delivery.send_discord_notification(
+                    "https://discord.example/hooks/secret-webhook", "hello"
+                ),
+                "secret-webhook",
+            ),
+        )
+        for send, secret in cases:
+            with self.subTest(secret=secret):
+                output = io.StringIO()
+                with patch.object(
+                    urllib.request,
+                    "urlopen",
+                    side_effect=OSError(f"transport failed for {secret}"),
+                ):
+                    with redirect_stdout(output):
+                        self.assertFalse(send())
+                self.assertNotIn(secret, output.getvalue())
+
+    def test_github_mutation_open_installs_no_redirect_handler(self) -> None:
+        request = urllib.request.Request(
+            "https://api.github.com/repos/me/repo/issues",
+            data=b"{}",
+            headers={"Authorization": "Bearer secret-token"},
+            method="POST",
+        )
+        with patch.object(urllib.request, "build_opener") as build_opener:
+            opener = build_opener.return_value
+            opener.open.return_value = FakeResponse()
+            self.assertIs(
+                REAL_GITHUB_MUTATION_OPEN(request, timeout=9),
+                opener.open.return_value,
+            )
+
+        self.assertIsInstance(
+            build_opener.call_args.args[0],
+            delivery._NoGitHubMutationRedirect,
+        )
+        opener.open.assert_called_once_with(request, timeout=9)
+
+    def test_github_mutations_refuse_all_redirects(self) -> None:
+        request = urllib.request.Request(
+            "https://api.github.com/repos/me/repo/issues",
+            data=b"{}",
+            headers={"Authorization": "Bearer secret-token"},
+            method="POST",
+        )
+        handler = delivery._NoGitHubMutationRedirect()
+
+        for target in (
+            "https://api.github.com/repos/me/repo/issues/42",
+            "https://evil.example/capture",
+        ):
+            with self.subTest(target=target):
+                with self.assertRaisesRegex(
+                    urllib.error.URLError,
+                    "GitHub mutation redirect refused",
+                ):
+                    handler.redirect_request(
+                        request,
+                        None,
+                        302,
+                        "redirect",
+                        {},
+                        target,
+                    )
+
+    def test_github_mutation_rejects_untrusted_initial_url_without_transport(self) -> None:
+        request_spec = delivery._github_request(
+            "https://evil.example/capture",
+            "secret-token",
+            method="POST",
+            payload={"title": "x"},
+        )
+        with patch.object(delivery, "_github_mutation_open") as opened:
+            result = delivery._perform_github_mutation(request_spec)
+
+        self.assertFalse(result.succeeded)
+        opened.assert_not_called()
+
+    def test_github_report_rejects_untrusted_created_issue_url_without_close(self) -> None:
+        with patch.object(
+            delivery,
+            "_github_mutation_open",
+            return_value=FakeResponse(b'{"url": "https://evil.example/issues/42"}'),
+        ) as opened:
+            self.assertFalse(
+                delivery.create_github_issue("me/repo", "secret-token", "title", "body")
+            )
+
+        opened.assert_called_once()
+        create_request = cast(urllib.request.Request, opened.call_args.args[0])
+        self.assertEqual(
+            create_request.full_url,
+            "https://api.github.com/repos/me/repo/issues",
+        )
+        self.assertEqual(create_request.get_header("Authorization"), "Bearer secret-token")
+
     def test_github_report_create_and_close_preserve_requests(self) -> None:
         created_url = "https://api.github.com/repos/me/repo/issues/42"
         with patch.object(
@@ -105,7 +237,7 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(opened.call_args_list[1].kwargs["timeout"], 15)
 
     def test_github_report_rejects_malformed_create_response(self) -> None:
-        for body in (b"not json", b"{}", b"[]", b'{"url": ""}'):
+        for body in (b"not json", b"{}", b"[]", b'{"url": ""}', b'{"url": 42}'):
             with self.subTest(body=body):
                 with patch.object(
                     urllib.request,
@@ -177,6 +309,24 @@ class DeliveryTests(unittest.TestCase):
 
     def test_private_github_report_fails_closed_for_unverified_privacy(self) -> None:
         for body in (b'{"private": false}', b"{}", b"[]", b"not json"):
+            with self.subTest(body=body):
+                with patch.object(
+                    urllib.request,
+                    "urlopen",
+                    return_value=FakeResponse(body),
+                ) as opened:
+                    self.assertFalse(
+                        delivery.create_private_github_issue(
+                            "owner/reports",
+                            "report-token",
+                            "title",
+                            "body",
+                        )
+                    )
+                opened.assert_called_once()
+
+    def test_private_github_report_requires_literal_true(self) -> None:
+        for body in (b'{"private": 1}', b'{"private": "true"}'):
             with self.subTest(body=body):
                 with patch.object(
                     urllib.request,

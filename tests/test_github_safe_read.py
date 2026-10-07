@@ -7,10 +7,19 @@ import urllib.error
 import urllib.request
 from contextlib import redirect_stdout
 from email.message import Message
+from typing import Any
 from unittest.mock import patch
 
 from opportunity_scout import delivery, github
 from tests.helpers import FakeResponse
+
+
+def github_open_via_urlopen(
+    request: urllib.request.Request,
+    *,
+    timeout: int,
+) -> Any:
+    return urllib.request.urlopen(request, timeout=timeout)
 
 
 def http_error(
@@ -32,6 +41,19 @@ def http_error(
 
 
 class SafeReadTests(unittest.TestCase):
+    def setUp(self) -> None:
+        read_patcher = patch.object(github, "_github_open", side_effect=github_open_via_urlopen)
+        read_patcher.start()
+        self.addCleanup(read_patcher.stop)
+
+        mutation_patcher = patch.object(
+            delivery,
+            "_github_mutation_open",
+            side_effect=github_open_via_urlopen,
+        )
+        mutation_patcher.start()
+        self.addCleanup(mutation_patcher.stop)
+
     def test_success_first_attempt(self) -> None:
         with patch.object(
             urllib.request, "urlopen", return_value=FakeResponse(b'{"ok": true}')
