@@ -1,0 +1,250 @@
+# Copy into .github/workflows/scout.yml in an independent PRIVATE repository.
+# Review the scanner SHA before adoption; upgrades are deliberate instance changes.
+# All workflows writing this state must share the same concurrency group.
+name: Private OSS Opportunity Scout
+
+"on":
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: scout-seen-state
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  scout:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    outputs:
+      recovery_required: ${{ steps.recovery_handoff.outputs.required }}
+      recovery_mode: ${{ steps.recovery_handoff.outputs.recovery_mode }}
+      recovery_outcome: ${{ steps.recovery_handoff.outputs.recovery_outcome }}
+      recovery_barrier_outcome: ${{ steps.recovery_handoff.outputs.recovery_barrier_outcome }}
+    env:
+      INSTANCE_BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      - name: Require private default-branch execution
+        shell: bash
+        env:
+          INSTANCE_PRIVATE: ${{ github.event.repository.private }}
+        run: |
+          set -euo pipefail
+          test "$INSTANCE_PRIVATE" = true
+          test "$GITHUB_REF" = "refs/heads/$INSTANCE_BRANCH"
+
+      - name: Check out current private instance after serialization
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          # Same-repository state push uses the caller's contents: write token.
+          persist-credentials: true
+
+      - name: Read current state and record transaction base
+        id: base
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "refs/heads/$INSTANCE_BRANCH"
+          git checkout --detach FETCH_HEAD
+          # This template requires deliberately seeded state, including for a
+          # genuinely new instance. It never silently bootstraps missing state.
+          test -f scout.toml
+          test -f seen_bounties.json
+          test ! -L scout.toml
+          test ! -L seen_bounties.json
+          printf 'sha=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse scans while recovery is required
+        id: recovery_gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          marker='.scout/recovery-required'
+          if test -e "$marker" || test -L "$marker"; then
+            echo '::error::Scout recovery is required. Restore or reconcile state and remove .scout/recovery-required deliberately before running the scanner.'
+            exit 1
+          fi
+
+      - name: Run pinned scanner source
+        id: scan
+        uses: laclance/OSSOpportunityScout@ad6cdb085bc18a2e6f1229f1a3469d2d695a0db0 # Reserved-status post-delivery recovery signal
+        timeout-minutes: 25
+        with:
+          config-path: scout.toml
+          state-path: seen_bounties.json
+          github-token: ${{ github.token }}
+          private-reports-repository: ${{ secrets.PRIVATE_GITHUB_REPORTS_REPOSITORY }}
+          private-reports-token: ${{ secrets.PRIVATE_GITHUB_REPORTS_TOKEN }}
+          telegram-bot-token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          telegram-chat-id: ${{ secrets.TELEGRAM_CHAT_ID }}
+          discord-webhook-url: ${{ secrets.DISCORD_WEBHOOK_URL }}
+
+      - name: Persist resulting state without replay or force push
+        id: persist
+        continue-on-error: true
+        shell: bash
+        env:
+          SCOUT_BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # Fetch never replaces the working state produced by the scanner.
+          # Reject any intervening branch change, even one outside this file.
+          git fetch --no-tags origin "refs/heads/$INSTANCE_BRANCH"
+          if test "$(git rev-parse FETCH_HEAD)" != "$SCOUT_BASE_SHA"; then
+            echo '::error::Private instance changed during scan; recover state before rerunning.'
+            exit 1
+          fi
+          git add -- seen_bounties.json
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git commit -m 'chore: persist scout state [skip ci]'
+          # A race after fetch is rejected by the ordinary non-forced push.
+          git push origin "HEAD:refs/heads/$INSTANCE_BRANCH"
+
+      - name: Classify transaction recovery requirement
+        id: transaction
+        if: ${{ always() }}
+        shell: bash
+        env:
+          SCAN_OUTCOME: ${{ steps.scan.outcome }}
+          SCAN_RECOVERY_REQUIRED: ${{ steps.scan.outputs.recovery-required }}
+          PERSIST_OUTCOME: ${{ steps.persist.outcome }}
+        run: |
+          set -euo pipefail
+          required=false
+          mode=none
+          if test "$PERSIST_OUTCOME" = failure; then
+            required=true
+            mode=exact-state
+          elif test "$SCAN_OUTCOME" = failure && test "$SCAN_RECOVERY_REQUIRED" = true; then
+            required=true
+            mode=reconstruct
+          fi
+          printf 'required=%s\n' "$required" >> "$GITHUB_OUTPUT"
+          printf 'mode=%s\n' "$mode" >> "$GITHUB_OUTPUT"
+
+      - name: Preserve exact state for private recovery
+        id: recovery
+        if: ${{ always() && steps.transaction.outputs.mode == 'exact-state' && github.event.repository.private == true }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: scout-state-recovery-${{ github.run_id }}-${{ github.run_attempt }}
+          path: seen_bounties.json
+          retention-days: 3
+          if-no-files-found: error
+
+      - name: Establish durable recovery barrier
+        id: recovery_barrier
+        if: ${{ always() && steps.transaction.outputs.required == 'true' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          barrier_root="$(mktemp -d)"
+          barrier_worktree="$barrier_root/worktree"
+          trap 'rm -rf "$barrier_root"; git worktree prune >/dev/null 2>&1 || true' EXIT
+
+          # Never build the barrier from the stale scan checkout or its failed
+          # state commit. Start from the current remote branch every time.
+          git fetch --no-tags origin "refs/heads/$INSTANCE_BRANCH"
+          git worktree add --detach "$barrier_worktree" FETCH_HEAD
+
+          marker="$barrier_worktree/.scout/recovery-required"
+          if test -e "$marker" || test -L "$marker"; then
+            exit 0
+          fi
+
+          mkdir -p "$barrier_worktree/.scout"
+          printf '%s\n'             'Recovery required. Restore or reconcile seen_bounties.json, then remove this marker deliberately in the recovery commit.'             > "$marker"
+          git -C "$barrier_worktree" add -- .scout/recovery-required
+          git -C "$barrier_worktree" config user.name 'github-actions[bot]'
+          git -C "$barrier_worktree" config user.email 'github-actions[bot]@users.noreply.github.com'
+          git -C "$barrier_worktree" commit -m 'chore: require scout recovery [skip ci]'
+          # Ordinary push preserves any newer remote history by failing on a race.
+          git -C "$barrier_worktree" push origin "HEAD:refs/heads/$INSTANCE_BRANCH"
+
+      - name: Publish recovery handoff
+        id: recovery_handoff
+        if: ${{ always() && steps.transaction.outputs.required == 'true' }}
+        shell: bash
+        env:
+          RECOVERY_MODE: ${{ steps.transaction.outputs.mode }}
+          RECOVERY_OUTCOME: ${{ steps.recovery.outcome }}
+          RECOVERY_BARRIER_OUTCOME: ${{ steps.recovery_barrier.outcome }}
+        run: |
+          set -euo pipefail
+          printf 'required=true\n' >> "$GITHUB_OUTPUT"
+          printf 'recovery_mode=%s\n' "$RECOVERY_MODE" >> "$GITHUB_OUTPUT"
+          printf 'recovery_outcome=%s\n' "$RECOVERY_OUTCOME" >> "$GITHUB_OUTPUT"
+          printf 'recovery_barrier_outcome=%s\n' "$RECOVERY_BARRIER_OUTCOME" >> "$GITHUB_OUTPUT"
+
+  cancel_queued:
+    needs: scout
+    if: ${{ always() && needs.scout.outputs.recovery_required == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Cancel queued state transactions before releasing lock
+        id: cancel_queued
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          queued_run_ids="$(
+            gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "/repos/$GH_REPO/actions/concurrency_groups/scout-seen-state" \
+              --jq ".group_members[] | select(.run_id != $CURRENT_RUN_ID) | .run_id" \
+              | sort -u
+          )"
+          while IFS= read -r run_id; do
+            test -n "$run_id" || continue
+            gh api \
+              --method POST \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "/repos/$GH_REPO/actions/runs/$run_id/cancel" \
+              >/dev/null
+          done <<< "$queued_run_ids"
+
+      - name: Fail scanner transaction after recovery attempt
+        if: ${{ always() }}
+        shell: bash
+        env:
+          RECOVERY_MODE: ${{ needs.scout.outputs.recovery_mode }}
+          RECOVERY_OUTCOME: ${{ needs.scout.outputs.recovery_outcome }}
+          RECOVERY_BARRIER_OUTCOME: ${{ needs.scout.outputs.recovery_barrier_outcome }}
+          QUEUE_CANCEL_OUTCOME: ${{ steps.cancel_queued.outcome }}
+        run: |
+          set -euo pipefail
+          if test "$RECOVERY_BARRIER_OUTCOME" != success; then
+            echo '::error::Post-delivery recovery is required and the durable recovery barrier could not be established. Stop all scout runs and establish recovery protection before any rerun.'
+          elif test "$RECOVERY_MODE" = reconstruct; then
+            if test "$QUEUE_CANCEL_OUTCOME" != success; then
+              echo '::error::Delivery succeeded but local state saving failed. The durable recovery marker blocks later scans even though queued-run cancellation failed. Reconstruct post-delivery state from trustworthy private evidence before removing the marker.'
+            else
+              echo '::error::Delivery succeeded but local state saving failed. The durable recovery marker is set and queued state transactions were cancelled. Reconstruct post-delivery state from trustworthy private evidence before removing the marker.'
+            fi
+          elif test "$RECOVERY_OUTCOME" != success; then
+            echo '::error::Remote state persistence and exact-state recovery preservation failed. The durable recovery marker blocks later scans. Reconstruct post-delivery state before removing it.'
+          elif test "$QUEUE_CANCEL_OUTCOME" != success; then
+            echo '::error::Remote state persistence failed. The durable recovery marker blocks later scans even though queued-run cancellation failed. Restore the private recovery artifact before removing the marker.'
+          else
+            echo '::error::Remote state persistence failed. The durable recovery marker is set and queued state transactions were cancelled. Restore the private recovery artifact before removing the marker.'
+          fi
+          exit 1
+

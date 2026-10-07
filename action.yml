@@ -1,0 +1,97 @@
+name: OSS Opportunity Scout
+description: Find and rank paid open-source bounties and high-value GitHub contribution opportunities.
+branding:
+  icon: search
+  color: orange
+inputs:
+  config-path:
+    description: Explicit version-1 TOML path, relative to the caller workspace or absolute
+    required: true
+  state-path:
+    description: Seen-state path, relative to the caller workspace or absolute
+    required: true
+  github-token:
+    description: Scanner discovery credential; never the private-report credential
+    required: true
+  private-reports-repository:
+    description: Optional private GitHub report destination
+    default: ''
+  private-reports-token:
+    description: Separate credential used only for privacy-verified private report delivery
+    default: ''
+  telegram-bot-token:
+    description: Optional Telegram delivery credential
+    default: ''
+  telegram-chat-id:
+    description: Optional Telegram destination
+    default: ''
+  discord-webhook-url:
+    description: Optional Discord delivery webhook
+    default: ''
+outputs:
+  recovery-required:
+    description: Whether scanner delivery succeeded but local state saving failed
+    value: ${{ steps.scanner.outputs.recovery-required }}
+  recovery-mode:
+    description: Recovery evidence mode for the classified scanner failure
+    value: ${{ steps.scanner.outputs.recovery-mode }}
+runs:
+  using: composite
+  steps:
+    - name: Set up Python 3.12
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+      with:
+        python-version: '3.12'
+    - name: Run pinned scanner
+      id: scanner
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      env:
+        SCANNER_SOURCE: ${{ github.action_path }}
+        SCOUT_CONFIG: ${{ inputs.config-path }}
+        SCOUT_STATE: ${{ inputs.state-path }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        GITHUB_REPORTS_ENABLED: 'false'
+        PRIVATE_GITHUB_REPORTS_REPOSITORY: ${{ inputs.private-reports-repository }}
+        PRIVATE_GITHUB_REPORTS_TOKEN: ${{ inputs.private-reports-token }}
+        TELEGRAM_BOT_TOKEN: ${{ inputs.telegram-bot-token }}
+        TELEGRAM_CHAT_ID: ${{ inputs.telegram-chat-id }}
+        DISCORD_WEBHOOK_URL: ${{ inputs.discord-webhook-url }}
+        PYTHONPATH: ''
+        PYTHONSAFEPATH: '1'
+      run: |
+        set -uo pipefail
+        # Internal reserved status: the scanner has no intentional status 86;
+        # ordinary Python exceptions use 1 and argparse usage errors use 2.
+        readonly post_delivery_save_status=86
+        status=0
+        # Absolute script path imports the package beside this pinned action,
+        # rather than any scanner code in the private caller's checkout.
+        # -I also excludes caller PYTHONPATH and user site packages; insert only
+        # this action's source root before invoking its stable executable shim.
+        python -I -c '
+        import runpy
+        import sys
+        import traceback
+
+        source = sys.argv.pop(1)
+        post_delivery_save_status = int(sys.argv.pop(1))
+        sys.path.insert(0, source)
+        from opportunity_scout.run import PostDeliveryStateSaveError
+
+        try:
+            runpy.run_path(source + "/opportunity_scout.py", run_name="__main__")
+        except PostDeliveryStateSaveError:
+            traceback.print_exc()
+            raise SystemExit(post_delivery_save_status)
+        ' "$SCANNER_SOURCE" "$post_delivery_save_status" \
+          --config "$SCOUT_CONFIG" --state "$SCOUT_STATE" || status=$?
+        set -e
+        if test "$status" -eq "$post_delivery_save_status"; then
+          printf 'recovery-required=true\\n' >> "$GITHUB_OUTPUT"
+          printf 'recovery-mode=reconstruct\\n' >> "$GITHUB_OUTPUT"
+        else
+          printf 'recovery-required=false\\n' >> "$GITHUB_OUTPUT"
+          printf 'recovery-mode=none\\n' >> "$GITHUB_OUTPUT"
+        fi
+        exit "$status"
