@@ -32,6 +32,18 @@ _ISSUE_BODY_IMPLEMENTATION_CONTEXT = re.compile(
     r"address(?:es|ed|ing)?|resolv(?:es|ed|ing)?)\b",
     re.IGNORECASE,
 )
+_ISSUE_BODY_HISTORICAL_PR_CONTEXT = re.compile(
+    r"\b(?:introduced|caused|triggered)\s+(?:(?:this|the|a)\s+)?"
+    r"(?:bug|regression|issue|problem)\b|"
+    r"\bled\b.{0,80}\b(?:(?:this|the|a)\s+)?(?:bug|regression|issue|problem)\b|"
+    r"\b(?:underlying|original)\s+(?:bug|issue|problem)\b.{0,100}"
+    r"\b(?:was(?:n['’]t| not)|is(?:n['’]t| not))\s+"
+    r"(?:addressed|fixed|resolved)\b|"
+    r"\b(?:did(?:n['’]t| not)|does(?:n['’]t| not))\s+"
+    r"(?:address|fix|resolve)\s+(?:(?:this|the|underlying|original)\s+)?"
+    r"(?:bug|issue|problem)\b",
+    re.IGNORECASE | re.DOTALL,
+)
 _COMMENT_PR_SHORTHAND = (
     re.compile(
         r"\b(?:related|implementation|opened|submitted)\s+"
@@ -45,6 +57,12 @@ _COMMENT_PR_SHORTHAND = (
         re.IGNORECASE,
     ),
 )
+_QUALIFIED_PR_URL = re.compile(
+    r"https://github\.com/(?P<repo>[^/\s]+/[^/\s]+)/pull/(?P<number>\d+)\b",
+    re.IGNORECASE,
+)
+_EXTERNAL_PR_ECHO_CONTEXT = 240
+
 _BRANCH_URL = re.compile(
     r"https://github\.com/(?P<owner>[^/\s]+)/[^/\s]+/tree/(?P<branch>[^\s)]+)",
     re.IGNORECASE,
@@ -74,6 +92,14 @@ _COMMENT_DUPLICATE_REDIRECT_RE = re.compile(
     re.IGNORECASE,
 )
 _CANONICAL_COMMENT_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR"}
+_SHARED_WORK_OVERRIDE_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
+_SHARED_WORK_OVERRIDE_RE = re.compile(
+    r"\b(?:general|tracking)\s+issue\b"
+    r".{0,240}\ball\s+contributions?\b"
+    r".{0,240}\bremaining\s+tasks?\b"
+    r".{0,120}\bwelcome\b",
+    re.IGNORECASE | re.DOTALL,
+)
 _LINKED_PR_FAILURE = "could not verify linked implementation PR"
 _CANONICAL_ISSUE_FAILURE = "could not verify canonical issue reference"
 _UNIDENTIFIABLE_ISSUE = "could not identify repository/issue number"
@@ -196,6 +222,21 @@ def _comment_claim_reason(comment: GitHubComment, issue_number: int | None) -> s
     return None
 
 
+def _comments_after_shared_work_override(
+    comments: list[GitHubComment],
+) -> list[GitHubComment]:
+    """Ignore claims made before a maintainer explicitly reopens a shared tracker."""
+    latest_override = -1
+    for index, comment in enumerate(comments):
+        association = str(comment.get("author_association") or "").upper()
+        body = str(comment.get("body") or "")
+        if association in _SHARED_WORK_OVERRIDE_ASSOCIATIONS and _SHARED_WORK_OVERRIDE_RE.search(
+            body
+        ):
+            latest_override = index
+    return comments[latest_override + 1 :]
+
+
 def strategic_claim_reason(
     item: GitHubIssue,
     comments: list[GitHubComment],
@@ -207,7 +248,7 @@ def strategic_claim_reason(
 
     identity = _IssueIdentity.from_issue(item)
     issue_number = identity.number if identity is not None else None
-    for comment in comments:
+    for comment in _comments_after_shared_work_override(comments):
         reason = _comment_claim_reason(comment, issue_number)
         if reason is not None:
             return reason
@@ -319,11 +360,31 @@ def _issue_body_pr_evidence(
     for match in _same_repository_pr_pattern(identity).finditer(text):
         context_start = max(0, match.start() - 160)
         context_end = min(len(text), match.end() + 160)
-        if _ISSUE_BODY_IMPLEMENTATION_CONTEXT.search(text[context_start:context_end]):
+        context = text[context_start:context_end]
+        if (
+            _ISSUE_BODY_IMPLEMENTATION_CONTEXT.search(context)
+            and _ISSUE_BODY_HISTORICAL_PR_CONTEXT.search(context) is None
+        ):
             evidence.append(
                 _LinkedPrEvidence(match.group(1), _LinkedPrEvidenceSource.ISSUE_BODY_URL)
             )
     return evidence
+
+
+def _external_pr_echo(
+    identity: _IssueIdentity,
+    text: str,
+    shorthand: re.Match[str],
+) -> bool:
+    number = shorthand.group(1)
+    start = max(0, shorthand.start() - _EXTERNAL_PR_ECHO_CONTEXT)
+    end = min(len(text), shorthand.end() + _EXTERNAL_PR_ECHO_CONTEXT)
+    for qualified in _QUALIFIED_PR_URL.finditer(text, start, end):
+        if qualified.group("number") != number:
+            continue
+        if qualified.group("repo").lower() != identity.repo.lower():
+            return True
+    return False
 
 
 def _comment_pr_evidence(
@@ -338,11 +399,16 @@ def _comment_pr_evidence(
             _LinkedPrEvidence(match.group(1), _LinkedPrEvidenceSource.COMMENT_URL)
             for match in same_repo_url.finditer(text)
         )
-        for shorthand in _COMMENT_PR_SHORTHAND:
-            evidence.extend(
-                _LinkedPrEvidence(match.group(1), _LinkedPrEvidenceSource.COMMENT_SHORTHAND)
-                for match in shorthand.finditer(text)
-            )
+        for shorthand_pattern in _COMMENT_PR_SHORTHAND:
+            for shorthand in shorthand_pattern.finditer(text):
+                if _external_pr_echo(identity, text, shorthand):
+                    continue
+                evidence.append(
+                    _LinkedPrEvidence(
+                        shorthand.group(1),
+                        _LinkedPrEvidenceSource.COMMENT_SHORTHAND,
+                    )
+                )
     return evidence
 
 

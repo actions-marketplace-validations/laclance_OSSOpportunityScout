@@ -8,6 +8,9 @@ from typing import Final
 _ClaimPatterns = tuple[re.Pattern[str], ...]
 
 
+_UNCHECKED_TASK_ITEM_RE: Final = re.compile(r"^\s*[-*+]\s*\[\s\]\s+.*$", re.MULTILINE)
+
+
 def _patterns(*expressions: str) -> _ClaimPatterns:
     return tuple(re.compile(expression, re.IGNORECASE) for expression in expressions)
 
@@ -23,6 +26,7 @@ _OWNERSHIP_PATTERNS: Final = _patterns(
     r"(?:a |the )?(?:pr|pull request)\b",
     r"\bi(?:'ll| will) (?:take|work on|handle|implement|fix|resolve)\b",
     r"\bi(?:'ll| will) take a look at implementing\b",
+    r"\bputting up (?:a |the )?(?:pr|pull request)\b(?=\s*[:.,;—-]|\s+(?:to|with|for)\b|$)",
     r"\bbefore i (?:write|start writing) code\b",
     r"\b(?:please|kindly) assign(?: it| this issue)? to me\b",
     r"\bassign (?:this|it) to me\b",
@@ -52,6 +56,7 @@ _IMPLEMENTATION_EVIDENCE_PATTERNS: Final = _patterns(
     r"^\s*starting (?:work on|a fix for)\b",
     r"^\s*delivered in pr\b",
     r"^\s*submitted (?:a )?pr\b",
+    r"\bpublished (?:a |the )?signed(?:/dco)? branch\b",
 )
 
 _PR_INTENT_PATTERNS: Final = _patterns(
@@ -103,9 +108,10 @@ def _has_concrete_first_person_plan(text: str) -> bool:
 def strategic_claim_text(text: str) -> bool:
     """Return whether text clearly claims ownership or active implementation work."""
     normalized = normalized_claim_text(text)
+    active_text = _UNCHECKED_TASK_ITEM_RE.sub("", normalized)
     return (
-        _takes_ownership(normalized)
-        or _has_implementation_evidence(normalized)
-        or _intends_to_submit_pr(normalized)
-        or _has_concrete_first_person_plan(normalized)
+        _takes_ownership(active_text)
+        or _has_implementation_evidence(active_text)
+        or _intends_to_submit_pr(active_text)
+        or _has_concrete_first_person_plan(active_text)
     )

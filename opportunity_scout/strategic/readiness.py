@@ -108,6 +108,7 @@ _REPRODUCTION_MARKERS: Final = (
 _IMPLEMENTATION_WAIT_MARKERS: Final = (
     "not ready for implementation",
     "not ready to implement",
+    "not a task for now",
     "please wait before implementing",
     "please wait to implement",
     "hold off on implementation",
@@ -279,6 +280,17 @@ _REPORTER_OPEN_DESIGN_RE: Final = re.compile(
     r"\bstill\s+open\s+discussion\b",
     re.IGNORECASE,
 )
+_REPORTER_WITHDRAWN_IMPLEMENTATION_RE: Final = re.compile(
+    r"\b(?:i|we)\s+(?:closed|withdrew)\s+(?:(?:my|our)\s+)?(?:implementation\s+)?"
+    r"(?:pr|pull request|#\d+)\b",
+    re.IGNORECASE,
+)
+_REPORTER_MAINTAINER_DECISION_RE: Final = re.compile(
+    r"\b(?:leav(?:e|ing)\s+(?:this|the issue)\s+open\s+for\s+(?:the\s+)?"
+    r"maintainers?\s+to\s+decide|(?:awaiting|waiting for)\s+(?:a\s+)?"
+    r"maintainer\s+decision)\b",
+    re.IGNORECASE,
+)
 _REPORTER_IMPLEMENTATION_CHOICE_RE: Final = re.compile(
     r"\b(?:it\s+isn['’]t\s+obvious\s+to\s+me\s+how\s+best|"
     r"is\s+having\b.{0,140}\breasonable|would\s+it\s+be\s+better|"
@@ -294,6 +306,13 @@ _CHILD_DELEGATION_RE: Final = re.compile(
 _TRACKING_INTENT_RE: Final = re.compile(
     r"\b(?:track and resolve|track the following|tracking issue for)\b",
     re.IGNORECASE,
+)
+_LIVING_FINDINGS_TRACKER_RE: Final = re.compile(
+    r"\b(?:collects?|aggregates?)\b.{0,160}\b(?:advisory\s+)?findings\b"
+    r".{0,240}\b(?:living\s+(?:document|report))\b|"
+    r"\b(?:living\s+(?:document|report))\b.{0,240}"
+    r"\b(?:collects?|aggregates?)\b.{0,160}\b(?:advisory\s+)?findings\b",
+    re.IGNORECASE | re.DOTALL,
 )
 _CHILD_CHECKBOX_RE: Final = re.compile(r"(?m)^\s*[-*]\s*\[[ xX]\]\s*#\d+\b")
 _DEPENDENCY_TRACKING_RE: Final = re.compile(
@@ -456,6 +475,20 @@ def maintainer_comment_authority(comment: GitHubComment) -> bool:
     return _comment_has_maintainer_authority(_comment_evidence(comment))
 
 
+def maintainer_reopened_frozen_signal(
+    comments: list[GitHubComment] | None,
+) -> bool:
+    """Recognize a maintainer deliberately reopening and preserving an issue."""
+    for comment in comments or []:
+        evidence = _comment_evidence(comment)
+        if evidence.author_association not in TRUSTED_ASSOCIATIONS:
+            continue
+        commands = {line.strip() for line in evidence.body_lower.splitlines()}
+        if "/reopen" in commands and "/lifecycle frozen" in commands:
+            return True
+    return False
+
+
 def _diagnostic_evidence_supplied(body: str) -> bool:
     return _DIAGNOSTIC_EVIDENCE_RE.search(body) is not None
 
@@ -561,6 +594,9 @@ def readiness_pending_label_reason(
         return None
 
     normalized_labels = tuple(_normalize_label_separators(label) for label in issue_label_set(item))
+    if "no decision" in normalized_labels:
+        return "awaiting maintainer decision"
+
     rules = (
         ("needs reproduction", "awaiting reproduction confirmation"),
         ("waiting for reproduction", "awaiting reproduction confirmation"),
@@ -685,17 +721,37 @@ def reporter_design_discussion_reason(
     item: GitHubIssue,
     comments: list[GitHubComment] | None,
 ) -> str | None:
-    """Reject when the reporter says multiple implementation choices remain under discussion."""
+    """Reject when the reporter says implementation is still awaiting a project decision."""
     evidence = _issue_evidence(item)
     reporter = evidence.reporter_login
     if not reporter:
         return None
 
-    reporter_comments = [
-        _comment_evidence(comment)
-        for comment in comments or []
-        if _comment_evidence(comment).login == reporter
-    ]
+    reporter_comments: list[_CommentEvidence] = []
+    implementation_decision_pending = False
+    for comment in comments or []:
+        comment_evidence = _comment_evidence(comment)
+        body = comment_evidence.normalized_body_lower
+
+        if comment_evidence.login == reporter:
+            reporter_comments.append(comment_evidence)
+            if _explicit_ready_signal(body):
+                implementation_decision_pending = False
+            elif _REPORTER_WITHDRAWN_IMPLEMENTATION_RE.search(
+                body
+            ) and _REPORTER_MAINTAINER_DECISION_RE.search(body):
+                implementation_decision_pending = True
+            continue
+
+        if (
+            implementation_decision_pending
+            and _comment_has_maintainer_authority(comment_evidence)
+            and _explicit_ready_signal(body)
+        ):
+            implementation_decision_pending = False
+
+    if implementation_decision_pending:
+        return "issue reporter withdrew implementation pending maintainer decision"
     if not reporter_comments:
         return None
 
@@ -818,6 +874,9 @@ def manual_tracking_issue_reason(
 ) -> str | None:
     """Reject explicit umbrella issues that track multiple child implementation tasks."""
     evidence = _issue_evidence(item)
+    if _LIVING_FINDINGS_TRACKER_RE.search(evidence.normalized_body_lower):
+        return _REASON_UMBRELLA
+
     if (
         evidence.author_association in TRUSTED_ASSOCIATIONS
         and "umbrella issue" in evidence.normalized_body_lower

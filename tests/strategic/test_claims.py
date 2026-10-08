@@ -37,6 +37,52 @@ class StrategicClaimTextTests(unittest.TestCase):
         self.assertTrue(strategic_claim_text("I’M GOING TO FIX THIS."))
         self.assertTrue(strategic_claim_text("I’D LIKE TO WORK ON THIS."))
 
+    def test_ignores_unchecked_markdown_claim_options(self) -> None:
+        self.assertFalse(
+            strategic_claim_text(
+                "Contribution Intention (Optional)\n\n"
+                "- [ ] Yes, I am willing to contribute a PR to implement this feature\n"
+                "- [x] No, I cannot work on a PR at this time"
+            )
+        )
+        self.assertTrue(
+            strategic_claim_text(
+                "Contribution Intention (Optional)\n\n"
+                "- [x] Yes, I am willing to contribute a PR to implement this feature\n"
+                "- [ ] No, I cannot work on a PR at this time"
+            )
+        )
+        self.assertTrue(
+            strategic_claim_text(
+                "- [ ] Yes, I am willing to contribute a PR\nI'm working on a fix now."
+            )
+        )
+
+    def test_published_signed_branch_is_active_implementation_evidence(self) -> None:
+        self.assertTrue(
+            strategic_claim_text(
+                "## R61 Progress\n\n"
+                "Published signed/DCO branch `codex/r61-distributed-execution-v1` "
+                "at `237d2666` to both repositories.\n\n"
+                "Implemented an owner-thread factory and bounded nonblocking commands."
+            )
+        )
+        self.assertFalse(
+            strategic_claim_text(
+                "The old signed branch was published last year and has since been abandoned."
+            )
+        )
+
+    def test_putting_up_pr_is_active_ownership(self) -> None:
+        self.assertTrue(
+            strategic_claim_text(
+                "Putting up a PR: route all setters through an update helper plus a regression test."
+            )
+        )
+        self.assertFalse(
+            strategic_claim_text("Putting up a PR would help once the design is agreed.")
+        )
+
     def test_multiple_claim_forms_in_one_body_remain_a_claim(self) -> None:
         self.assertTrue(
             strategic_claim_text(

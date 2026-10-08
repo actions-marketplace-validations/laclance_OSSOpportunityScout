@@ -133,6 +133,20 @@ class ClaimCompetitionTests(unittest.TestCase):
 
         self.assertIsNone(
             competition.strategic_claim_reason(
+                issue(
+                    body=(
+                        "Contribution Intention (Optional)\n\n"
+                        "- [ ] Yes, I am willing to contribute a PR to implement this feature\n"
+                        "- [x] No, I cannot work on a PR at this time"
+                    ),
+                    created_at=recent,
+                ),
+                [],
+            )
+        )
+
+        self.assertIsNone(
+            competition.strategic_claim_reason(
                 issue(body=""),
                 [
                     {
@@ -215,6 +229,59 @@ class ClaimCompetitionTests(unittest.TestCase):
                 timeline_pr_checker=lambda *_: self.fail("timeline PR check should not be reached"),
             ),
             "active claim by @elevasyncsolutions-jpg",
+        )
+
+    def test_maintainer_shared_tracker_override_clears_only_earlier_claims(self) -> None:
+        recent = datetime.now(timezone.utc).isoformat()
+        old_claim: GitHubComment = {
+            "body": "I can work on these two annotations.",
+            "updated_at": recent,
+            "author_association": "CONTRIBUTOR",
+            "user": {"login": "ris-tlp"},
+        }
+        shared_override: GitHubComment = {
+            "body": (
+                "I won't assign you to this task, as it's a general issue, "
+                "but all contributions to the remaining tasks are welcome!"
+            ),
+            "updated_at": recent,
+            "author_association": "MEMBER",
+            "user": {"login": "maintainer"},
+        }
+
+        self.assertIsNone(
+            competition.strategic_claim_reason(
+                issue(body=""),
+                [old_claim, shared_override],
+            )
+        )
+
+        untrusted_override: GitHubComment = {
+            "body": shared_override["body"],
+            "updated_at": recent,
+            "author_association": "NONE",
+            "user": {"login": "maintainer"},
+        }
+        self.assertEqual(
+            competition.strategic_claim_reason(
+                issue(body=""),
+                [old_claim, untrusted_override],
+            ),
+            "active claim by @ris-tlp",
+        )
+
+        later_claim: GitHubComment = {
+            "body": "I'll work on the remaining annotation.",
+            "updated_at": recent,
+            "author_association": "NONE",
+            "user": {"login": "new-dev"},
+        }
+        self.assertEqual(
+            competition.strategic_claim_reason(
+                issue(body=""),
+                [old_claim, shared_override, later_claim],
+            ),
+            "active claim by @new-dev",
         )
 
     def test_taking_this_one_is_active_ownership(self) -> None:
@@ -753,6 +820,35 @@ class LinkedPullRequestTests(unittest.TestCase):
             self.assertIsNone(competition.linked_open_pr_reason(background, "t", []))
         no_fetch.assert_not_called()
 
+    def test_issue_body_ignores_historical_pr_that_introduced_bug(self) -> None:
+        grpc_issue = issue(
+            html_url="https://github.com/grpc/grpc-go/issues/9470",
+            comments=0,
+            body=(
+                "I came across [this](https://github.com/grpc/grpc-go/pull/6799/) PR "
+                "in which mutexes were replaced by atomic pointers, which had led this bug "
+                "to creep in. Isn't this implementation actually detrimental to performance?"
+            ),
+        )
+        with patch.object(github, "github_get") as getter:
+            self.assertIsNone(competition.linked_open_pr_reason(grpc_issue, "t", []))
+        getter.assert_not_called()
+
+    def test_issue_body_ignores_prior_pr_that_left_underlying_issue_unaddressed(self) -> None:
+        flux_issue = issue(
+            html_url="https://github.com/fluxcd/flux2/issues/6014",
+            comments=0,
+            body=(
+                "The memory-build default was disabled in "
+                "https://github.com/fluxcd/flux2/pull/5969. "
+                "The underlying issue of where to lock wasn't addressed however, "
+                "so the flag is still broken when used with --path."
+            ),
+        )
+        with patch.object(github, "github_get") as getter:
+            self.assertIsNone(competition.linked_open_pr_reason(flux_issue, "t", []))
+        getter.assert_not_called()
+
     def test_linked_pr_ignores_flux_historical_bare_pr_reference(self) -> None:
         comments: list[GitHubComment] = [
             {"body": "PR #1625's health-check requeue is also downstream of build/apply."}
@@ -785,6 +881,76 @@ class LinkedPullRequestTests(unittest.TestCase):
                 )
             )
         getter.assert_not_called()
+
+    def test_linked_pr_ignores_external_implementation_pr_number_echo(self) -> None:
+        comments: list[GitHubComment] = [
+            {
+                "body": (
+                    "Verified external-effect advance. Receiver implementation PR #13406: "
+                    "https://github.com/QwenLM/qwen-code/pull/13406. "
+                    "The receiver implementation remains open and unmerged."
+                )
+            }
+        ]
+        with patch.object(github, "github_get") as getter:
+            self.assertIsNone(
+                competition.linked_open_pr_reason(
+                    issue(
+                        html_url="https://github.com/Nakagawa-master/nakagawa-theory-archive/issues/402"
+                    ),
+                    "t",
+                    comments,
+                )
+            )
+        getter.assert_not_called()
+
+    def test_same_repo_qualified_pr_does_not_suppress_matching_shorthand(self) -> None:
+        comments: list[GitHubComment] = [
+            {"body": ("Implementation PR #12: https://github.com/example/project/pull/12")}
+        ]
+        with patch.object(
+            github,
+            "github_get",
+            return_value={
+                "state": "open",
+                "html_url": "https://github.com/example/project/pull/12",
+            },
+        ) as getter:
+            self.assertEqual(
+                competition.linked_open_pr_reason(issue(), "t", comments),
+                "existing open implementation PR: https://github.com/example/project/pull/12",
+            )
+        getter.assert_called_once_with(
+            "https://api.github.com/repos/example/project/pulls/12",
+            "t",
+        )
+
+    def test_external_pr_echo_only_suppresses_nearby_matching_number(self) -> None:
+        comments: list[GitHubComment] = [
+            {
+                "body": (
+                    "External background: https://github.com/other/project/pull/12. "
+                    + ("unrelated context " * 30)
+                    + "Implementation PR #12"
+                )
+            }
+        ]
+        with patch.object(
+            github,
+            "github_get",
+            return_value={
+                "state": "open",
+                "html_url": "https://github.com/example/project/pull/12",
+            },
+        ) as getter:
+            self.assertEqual(
+                competition.linked_open_pr_reason(issue(), "t", comments),
+                "existing open implementation PR: https://github.com/example/project/pull/12",
+            )
+        getter.assert_called_once_with(
+            "https://api.github.com/repos/example/project/pulls/12",
+            "t",
+        )
 
     def test_linked_pr_keeps_strong_same_repo_implementation_shorthand(self) -> None:
         comments: list[GitHubComment] = [{"body": "Implementation PR #12"}]

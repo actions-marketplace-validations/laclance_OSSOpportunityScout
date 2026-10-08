@@ -29,6 +29,13 @@ class ReadinessLabelTests(unittest.TestCase):
             readiness.readiness_pending_label_reason(issue(labels=["needs/design"])),
             "awaiting maintainer design decision",
         )
+        self.assertEqual(
+            readiness.readiness_pending_label_reason(issue(labels=["no decision"])),
+            "awaiting maintainer decision",
+        )
+        self.assertIsNone(
+            readiness.readiness_pending_label_reason(issue(labels=["no decision needed"]))
+        )
         self.assertIsNone(
             readiness.readiness_pending_label_reason(
                 issue(labels=["needs-investigation"]),
@@ -51,6 +58,30 @@ class ReadinessLabelTests(unittest.TestCase):
         )
         labels_text = " ".join(readiness.issue_label_set(connection_pool))
         self.assertTrue(readiness.triage_pending_signal(labels_text))
+
+    def test_reopened_frozen_requires_trusted_maintainer_commands(self) -> None:
+        preserved: list[GitHubComment] = [
+            {
+                "body": "/remove-lifecycle rotten\n/lifecycle frozen\n/reopen",
+                "author_association": "MEMBER",
+            }
+        ]
+        self.assertTrue(readiness.maintainer_reopened_frozen_signal(preserved))
+
+        cases: tuple[list[GitHubComment], ...] = (
+            [
+                {
+                    "body": "/lifecycle frozen\n/reopen",
+                    "author_association": "NONE",
+                }
+            ],
+            [{"body": "/lifecycle frozen", "author_association": "MEMBER"}],
+            [{"body": "/reopen", "author_association": "MEMBER"}],
+            [],
+        )
+        for comments in cases:
+            with self.subTest(comments=comments):
+                self.assertFalse(readiness.maintainer_reopened_frozen_signal(comments))
 
     def test_stale_label_is_not_abandoned_lifecycle(self) -> None:
         self.assertIsNone(readiness.abandoned_lifecycle_reason(issue(labels=[{"name": "stale"}])))
@@ -366,6 +397,49 @@ class MaintainerReadinessTests(unittest.TestCase):
         ]
         self.assertEqual(
             readiness.maintainer_readiness_comment_state(issue(), later_ready),
+            (True, None),
+        )
+
+    def test_prometheus_not_a_task_for_now_blocks_implementation(self) -> None:
+        comments: list[GitHubComment] = [
+            {
+                "body": "This is an issue for when we will release 4.0, not a task for now.",
+                "author_association": "MEMBER",
+            },
+            {
+                "body": (
+                    "We're open to it, but need a bit more motivation. "
+                    "How breaking is this for users?"
+                ),
+                "author_association": "MEMBER",
+            },
+        ]
+
+        self.assertEqual(
+            readiness.maintainer_readiness_comment_state(issue(), comments),
+            (False, "maintainer asked contributors to wait before implementation"),
+        )
+
+    def test_not_a_task_for_now_requires_maintainer_authority_and_can_be_revived(self) -> None:
+        hold: GitHubComment = {
+            "body": "This is not a task for now.",
+            "author_association": "NONE",
+        }
+        self.assertEqual(
+            readiness.maintainer_readiness_comment_state(issue(), [hold]),
+            (None, None),
+        )
+
+        trusted_hold: GitHubComment = {
+            "body": "This is not a task for now.",
+            "author_association": "MEMBER",
+        }
+        ready: GitHubComment = {
+            "body": "This is active again; contributions welcome.",
+            "author_association": "MEMBER",
+        }
+        self.assertEqual(
+            readiness.maintainer_readiness_comment_state(issue(), [trusted_hold, ready]),
             (True, None),
         )
 
@@ -876,6 +950,73 @@ class ReporterDesignDiscussionTests(unittest.TestCase):
             )
         )
 
+    def test_etcd_reporter_withdraws_pr_pending_maintainer_decision(self) -> None:
+        item = issue(user={"login": "srebb"})
+        comments: list[GitHubComment] = [
+            {
+                "user": {"login": "srebb"},
+                "body": (
+                    "End-to-end numbers show no clear benefit. I closed #22501 for now, "
+                    "leaving this open for the maintainers to decide."
+                ),
+            }
+        ]
+
+        self.assertEqual(
+            readiness.reporter_design_discussion_reason(item, comments),
+            "issue reporter withdrew implementation pending maintainer decision",
+        )
+
+    def test_withdrawn_implementation_requires_both_reporter_signals(self) -> None:
+        item = issue(user={"login": "reporter"})
+        cases: tuple[list[GitHubComment], ...] = (
+            [
+                {
+                    "user": {"login": "reporter"},
+                    "body": (
+                        "I closed PR #42 because its benchmark failed. "
+                        "I will rework it and send a replacement."
+                    ),
+                }
+            ],
+            [
+                {
+                    "user": {"login": "reporter"},
+                    "body": "Leaving this open for the maintainers to decide.",
+                }
+            ],
+            [
+                {
+                    "user": {"login": "someone-else"},
+                    "body": (
+                        "I closed PR #42 for now, leaving this open for the maintainers to decide."
+                    ),
+                }
+            ],
+        )
+
+        for comments in cases:
+            with self.subTest(comments=comments):
+                self.assertIsNone(readiness.reporter_design_discussion_reason(item, comments))
+
+    def test_maintainer_ready_signal_revives_withdrawn_implementation(self) -> None:
+        item = issue(user={"login": "reporter"})
+        comments: list[GitHubComment] = [
+            {
+                "user": {"login": "reporter"},
+                "body": (
+                    "I closed my PR for now, leaving this open for the maintainers to decide."
+                ),
+            },
+            {
+                "user": {"login": "maintainer"},
+                "author_association": "MEMBER",
+                "body": "The direction is decided now; contributions welcome.",
+            },
+        ]
+
+        self.assertIsNone(readiness.reporter_design_discussion_reason(item, comments))
+
     def test_latest_reporter_ready_signal_restores_actionability(self) -> None:
         item = issue(
             user={"login": "reporter"},
@@ -1109,6 +1250,34 @@ class ReporterSupportTriageTests(unittest.TestCase):
 
 
 class ManualTrackingIssueTests(unittest.TestCase):
+    def test_living_advisory_report_is_not_single_implementation_task(self) -> None:
+        tracker = issue(
+            title="Hive Advisory Report",
+            body=(
+                "This issue collects advisory findings from automated agents. "
+                "Do not close this issue. It is a living document."
+            ),
+        )
+        self.assertEqual(
+            readiness.manual_tracking_issue_reason(tracker),
+            "umbrella tracking issue, not a single implementation task",
+        )
+        self.assertIsNone(
+            readiness.manual_tracking_issue_reason(
+                issue(
+                    body=(
+                        "This design note is a living document for one implementation. "
+                        "Keep the acceptance criteria current."
+                    )
+                )
+            )
+        )
+        self.assertIsNone(
+            readiness.manual_tracking_issue_reason(
+                issue(body="This issue collects findings for this one parser bug.")
+            )
+        )
+
     def test_multi_child_umbrella_tracker_is_not_single_implementation_task(self) -> None:
         tracker = issue(
             body=(

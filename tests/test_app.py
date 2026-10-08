@@ -583,6 +583,19 @@ class VerificationTests(unittest.TestCase):
         )
         self.assertEqual(
             scout.strategic_rejection(
+                issue(
+                    title="Hive Advisory Report",
+                    body=(
+                        "This issue collects advisory findings from agents. "
+                        "Do not close this issue. It is a living document."
+                    ),
+                ),
+                "t",
+            ),
+            "umbrella tracking issue, not a single implementation task",
+        )
+        self.assertEqual(
+            scout.strategic_rejection(
                 {"html_url": "bad", "title": "x", "body": "", "labels": []}, "t"
             ),
             "could not identify repository/issue number",
@@ -616,6 +629,54 @@ class VerificationTests(unittest.TestCase):
                     issue(labels=[{"name": "needs-triage"}, {"name": "good first issue"}]),
                     "t",
                 )
+            )
+
+        with patch.object(scout, "strategic_competition_reason", return_value=None):
+            self.assertIsNone(
+                scout.strategic_rejection(
+                    issue(
+                        labels=[
+                            {"name": "kind/bug/possible"},
+                            {"name": "contributor/wanted"},
+                        ],
+                        comments=1,
+                    ),
+                    "t",
+                    [],
+                )
+            )
+
+        maintainer_reopen: list[GitHubComment] = [
+            {
+                "body": "/remove-lifecycle rotten\n/lifecycle frozen\n/reopen",
+                "author_association": "MEMBER",
+            }
+        ]
+        with patch.object(scout, "strategic_competition_reason", return_value=None):
+            self.assertIsNone(
+                scout.strategic_rejection(
+                    issue(
+                        labels=[{"name": "needs-triage"}, {"name": "lifecycle/frozen"}],
+                        comments=1,
+                    ),
+                    "t",
+                    maintainer_reopen,
+                )
+            )
+            self.assertEqual(
+                scout.strategic_rejection(
+                    issue(
+                        labels=[
+                            {"name": "needs-triage"},
+                            {"name": "needs/design"},
+                            {"name": "lifecycle/frozen"},
+                        ],
+                        comments=1,
+                    ),
+                    "t",
+                    maintainer_reopen,
+                ),
+                "awaiting maintainer design decision",
             )
 
         with (
@@ -678,11 +739,20 @@ class VerificationTests(unittest.TestCase):
             title="Per-request metrics",
             labels=[{"name": "kind/proposal"}],
         )
+        no_decision = issue(
+            title="Add config update command",
+            labels=[{"name": "no decision"}],
+        )
 
         with patch.object(scout, "strategic_competition_reason", return_value=None):
             self.assertIsNone(scout.strategic_rejection(pending, "t", ready_comments))
             self.assertIsNone(scout.strategic_rejection(feature, "t", []))
             self.assertIsNone(scout.strategic_rejection(proposal_without_hold, "t", []))
+            self.assertEqual(
+                scout.strategic_rejection(no_decision, "t", []),
+                "awaiting maintainer decision",
+            )
+            self.assertIsNone(scout.strategic_rejection(no_decision, "t", ready_comments))
 
         self.assertIsNone(
             scout.readiness_pending_label_reason(
@@ -1495,6 +1565,17 @@ class DiscoveryTests(unittest.TestCase):
         self.assertIsNone(
             scout.strategic_preflight_rejection(
                 issue(labels=[{"name": "needs-triage"}], comments=1)
+            )
+        )
+        self.assertIsNone(
+            scout.strategic_preflight_rejection(
+                issue(
+                    labels=[
+                        {"name": "kind/bug/possible"},
+                        {"name": "contributor/wanted"},
+                    ],
+                    comments=0,
+                )
             )
         )
 

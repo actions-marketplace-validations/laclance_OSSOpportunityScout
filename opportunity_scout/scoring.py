@@ -173,7 +173,13 @@ def maintainer_ready_signal(labels_text: str) -> bool:
     normalized = re.sub(r"[-_]+", " ", labels_text.lower())
     return any(
         marker in normalized
-        for marker in ("help wanted", "good first issue", "triage/accepted", "refined")
+        for marker in (
+            "help wanted",
+            "good first issue",
+            "triage/accepted",
+            "contributor/wanted",
+            "refined",
+        )
     )
 
 
@@ -275,6 +281,17 @@ def estimate_effort_details(
 
     if documentation_microfix(item):
         return EffortEstimate("<1h", ("documentation-only micro-fix",))
+
+    whole_surface_migration = bool(
+        re.search(
+            r"\b(?:migrat(?:e|ing)|replace|convert)\b.{0,120}"
+            r"\b(?:all|every|remaining)\s+(?:rules?|paths?|call(?:s|sites)?|uses?)\b",
+            evidence.text,
+            re.DOTALL,
+        )
+    )
+    if whole_surface_migration:
+        return EffortEstimate("1d+", ("whole-surface interface migration",))
 
     explicit_large = bool(
         re.search(
