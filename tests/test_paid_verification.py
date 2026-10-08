@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from opportunity_scout import github, paid_verification
 from opportunity_scout.types import GitHubIssue, SourceFailureReason
@@ -67,6 +67,52 @@ class ExistingImplementationPrTests(unittest.TestCase):
                     "tok",
                 )
             ],
+        )
+
+    def test_timeline_pr_filter_can_ignore_superseded_match_and_keep_scanning(
+        self,
+    ) -> None:
+        timeline = [
+            {
+                "event": "cross-referenced",
+                "source": {
+                    "issue": {
+                        "pull_request": {},
+                        "state": "open",
+                        "html_url": "https://github.com/acme/widget/pull/9",
+                        "repository_url": "https://api.github.com/repos/acme/widget",
+                        "title": "Old widget fix",
+                        "body": "Fixes #42",
+                        "user": {"login": "old-dev"},
+                        "updated_at": "2026-09-23T17:25:07Z",
+                    }
+                },
+            },
+            {
+                "event": "cross-referenced",
+                "source": {
+                    "issue": {
+                        "pull_request": {},
+                        "state": "open",
+                        "html_url": "https://github.com/acme/widget/pull/10",
+                        "repository_url": "https://api.github.com/repos/acme/widget",
+                        "title": "Current widget fix",
+                        "body": "Fixes #42",
+                        "user": {"login": "current-dev"},
+                        "updated_at": "2026-10-08T18:00:00Z",
+                    }
+                },
+            },
+        ]
+
+        self.assertEqual(
+            paid_verification.existing_implementation_pr_reason(
+                timeline,
+                "acme/widget",
+                42,
+                ignore_open_pull=lambda pull: pull.get("html_url", "").endswith("/9"),
+            ),
+            "existing open implementation PR: https://github.com/acme/widget/pull/10",
         )
 
     def test_issue_reference_scope_distinguishes_same_and_cross_repository_prs(self) -> None:
@@ -362,6 +408,171 @@ class ExistingImplementationPrTests(unittest.TestCase):
             "existing open implementation PR: https://github.com/prometheus/common/pull/1008",
         )
 
+    def test_repository_fallback_detects_cilium_pr_without_timeline_cross_reference(
+        self,
+    ) -> None:
+        calls: list[str] = []
+
+        def fetch_open_pulls(url: str, _token: str | None) -> Any:
+            calls.append(url)
+            return [
+                {
+                    "state": "open",
+                    "html_url": "https://github.com/cilium/cilium/pull/49238",
+                    "title": (
+                        "gateway-api: Improve performance of Namespace watch handler "
+                        "for Selector listeners"
+                    ),
+                    "body": (
+                        "This makes the namespace handler linear.\n\n"
+                        "As I mentioned in #49235, controller-runtime now waits for "
+                        "initial event handlers before starting."
+                    ),
+                }
+            ]
+
+        self.assertEqual(
+            paid_verification.has_existing_implementation_pr(
+                "cilium/cilium",
+                49235,
+                "tok",
+                fetch_json=lambda *_: [],
+                fetch_open_pulls=fetch_open_pulls,
+            ),
+            "existing open implementation PR: https://github.com/cilium/cilium/pull/49238",
+        )
+        self.assertEqual(
+            calls,
+            ["https://api.github.com/repos/cilium/cilium/pulls?state=open&per_page=100"],
+        )
+
+    def test_repository_fallback_detects_kubernetes_related_issue_section(self) -> None:
+        open_pulls = [
+            {
+                "state": "open",
+                "html_url": "https://github.com/kubernetes/kubernetes/pull/138248",
+                "title": "e2e_node: fix swap LimitedSwap stress flake",
+                "body": (
+                    "#### Which issue(s) this PR is related to:\n\n"
+                    "<!-- template guidance omitted -->\n\n"
+                    "https://github.com/kubernetes/kubernetes/issues/138226"
+                ),
+            }
+        ]
+
+        self.assertEqual(
+            paid_verification.has_existing_implementation_pr(
+                "kubernetes/kubernetes",
+                138226,
+                "tok",
+                fetch_json=lambda *_: [],
+                fetch_open_pulls=lambda *_: open_pulls,
+            ),
+            (
+                "existing open implementation PR: "
+                "https://github.com/kubernetes/kubernetes/pull/138248"
+            ),
+        )
+
+    def test_repository_fallback_can_ignore_superseded_matching_pr(self) -> None:
+        open_pulls = [
+            {
+                "state": "open",
+                "html_url": "https://github.com/acme/widget/pull/9",
+                "title": "Old widget fix",
+                "body": "Fixes #42",
+            },
+            {
+                "state": "open",
+                "html_url": "https://github.com/acme/widget/pull/10",
+                "title": "Current widget fix",
+                "body": "Fixes #42",
+            },
+        ]
+
+        self.assertEqual(
+            paid_verification.repository_open_implementation_pr_reason(
+                "acme/widget",
+                42,
+                "tok",
+                fetch_open_pulls=lambda *_: open_pulls,
+                ignore_open_pull=lambda pull: pull.get("html_url", "").endswith("/9"),
+            ),
+            "existing open implementation PR: https://github.com/acme/widget/pull/10",
+        )
+
+    def test_repository_fallback_detects_direct_fix_reference(self) -> None:
+        open_pulls = [
+            {
+                "state": "open",
+                "html_url": "https://github.com/acme/widget/pull/10",
+                "title": "Fix widget race",
+                "body": "Fixes #42",
+            }
+        ]
+
+        self.assertEqual(
+            paid_verification.has_existing_implementation_pr(
+                "acme/widget",
+                42,
+                "tok",
+                fetch_json=lambda *_: [],
+                fetch_open_pulls=lambda *_: open_pulls,
+            ),
+            "existing open implementation PR: https://github.com/acme/widget/pull/10",
+        )
+
+    def test_repository_fallback_ignores_generic_same_repo_context_reference(self) -> None:
+        open_pulls = [
+            {
+                "state": "open",
+                "html_url": "https://github.com/acme/widget/pull/9",
+                "title": "Document widget architecture",
+                "body": "For context, see #42 before changing the cache documentation.",
+            }
+        ]
+
+        self.assertIsNone(
+            paid_verification.has_existing_implementation_pr(
+                "acme/widget",
+                42,
+                "tok",
+                fetch_json=lambda *_: [],
+                fetch_open_pulls=lambda *_: open_pulls,
+            )
+        )
+
+    def test_repository_fallback_fails_closed_on_unusable_open_pr_listing(self) -> None:
+        values: tuple[object, ...] = (
+            None,
+            {},
+            ["bad"],
+            [{"html_url": None, "title": "Fix", "body": None}],
+            [{"html_url": "", "title": "Fix", "body": None}],
+            [{"html_url": "https://github.com/acme/widget/pull/9", "title": None, "body": None}],
+            [
+                {
+                    "html_url": "https://github.com/acme/widget/pull/9",
+                    "title": "Fix",
+                    "body": {"bad": "shape"},
+                }
+            ],
+        )
+        for value in values:
+            with self.subTest(value=value):
+                reason = paid_verification.has_existing_implementation_pr(
+                    "acme/widget",
+                    42,
+                    "tok",
+                    fetch_json=lambda *_: [],
+                    fetch_open_pulls=lambda *_args, value=value: value,
+                )
+                self.assertEqual(
+                    reason,
+                    "could not verify repository open implementation PRs",
+                )
+                self.assertIsInstance(reason, SourceFailureReason)
+
     def test_downstream_pr_reference_to_upstream_proposal_is_not_implementation(
         self,
     ) -> None:
@@ -452,14 +663,24 @@ class ExistingImplementationPrTests(unittest.TestCase):
                 self.assertEqual(reason, "could not verify open implementation PR timeline")
                 self.assertIsInstance(reason, SourceFailureReason)
 
-    def test_default_transport_is_used_once(self) -> None:
+    def test_default_transport_checks_timeline_then_cached_repository_pulls(self) -> None:
+        paid_verification._OPEN_PULL_REQUESTS_CACHE.clear()
         with patch.object(github, "github_collection", return_value=[]) as getter:
             self.assertIsNone(
                 paid_verification.has_existing_implementation_pr("acme/widget", 42, "tok")
             )
-        getter.assert_called_once_with(
-            "https://api.github.com/repos/acme/widget/issues/42/timeline?per_page=100",
-            "tok",
+        self.assertEqual(
+            getter.call_args_list,
+            [
+                call(
+                    "https://api.github.com/repos/acme/widget/issues/42/timeline?per_page=100",
+                    "tok",
+                ),
+                call(
+                    "https://api.github.com/repos/acme/widget/pulls?state=open&per_page=100",
+                    "tok",
+                ),
+            ],
         )
 
 

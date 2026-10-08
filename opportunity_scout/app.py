@@ -274,6 +274,8 @@ def strategic_competition_reason(
     """Apply strategic-only competition checks through the extracted policy module."""
     loaded_comments = issue_comments(item, token) if comments is None else comments
     timeline_pr_checker: competition_policy.TimelinePrChecker = timeline_open_pr_reason
+    if timeline_events is None:
+        _, timeline_events = _strategic_timeline_evidence(item, token)
     if timeline_events is not None:
 
         def prefetched_timeline_pr_checker(
@@ -281,10 +283,28 @@ def strategic_competition_reason(
             _token: str | None,
         ) -> str | None:
             repo, number = github.issue_repo_and_number(_item)
-            return paid_verification.existing_implementation_pr_reason(
+            repository = cast(str, repo)
+            issue_number = cast(int, number)
+
+            def ignore_open_pull(raw_pull: dict[str, Any]) -> bool:
+                return competition_policy.strategic_open_pr_is_superseded(
+                    raw_pull,
+                    timeline_events,
+                )
+
+            reason = paid_verification.existing_implementation_pr_reason(
                 timeline_events,
-                cast(str, repo),
-                cast(int, number),
+                repository,
+                issue_number,
+                ignore_open_pull=ignore_open_pull,
+            )
+            if reason is not None:
+                return reason
+            return paid_verification.repository_open_implementation_pr_reason(
+                repository,
+                issue_number,
+                _token,
+                ignore_open_pull=ignore_open_pull,
             )
 
         timeline_pr_checker = prefetched_timeline_pr_checker

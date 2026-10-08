@@ -1098,6 +1098,11 @@ class VerificationTests(unittest.TestCase):
             patch.object(github, "github_collection", return_value=timeline) as timeline_fetch,
             patch.object(github, "issue_comments_checked") as comments_fetch,
             patch.object(scout, "timeline_open_pr_reason") as timeline_network_check,
+            patch.object(
+                paid_verification,
+                "repository_open_implementation_pr_reason",
+                return_value=None,
+            ) as repository_pr_check,
             patch.object(scout, "linked_open_pr_reason", return_value=None),
             patch.object(scout, "fetch_repo_metadata", return_value=meta),
             patch.object(scout, "contribution_guide", return_value=None),
@@ -1118,6 +1123,241 @@ class VerificationTests(unittest.TestCase):
         )
         comments_fetch.assert_not_called()
         timeline_network_check.assert_not_called()
+        repository_pr_check.assert_called_once()
+        self.assertEqual(repository_pr_check.call_args.args, ("example/project", 42, "t"))
+        self.assertIn("ignore_open_pull", repository_pr_check.call_args.kwargs)
+
+    def test_verify_strategic_prefetched_timeline_keeps_direct_pr_evidence(self) -> None:
+        fresh = issue(
+            body="Parser task",
+            title="Parser task",
+            comments=1,
+            labels=[{"name": "help wanted"}, {"name": "bug"}],
+        )
+        timeline = [
+            {
+                "event": "commented",
+                "body": "Thanks for the report.",
+                "author_association": "NONE",
+                "user": {"login": "observer"},
+                "created_at": "2026-10-01T00:00:00Z",
+                "updated_at": "2026-10-01T00:00:00Z",
+            },
+            {
+                "event": "cross-referenced",
+                "source": {
+                    "issue": {
+                        "pull_request": {},
+                        "state": "open",
+                        "html_url": "https://github.com/example/project/pull/43",
+                        "repository_url": "https://api.github.com/repos/example/project",
+                        "title": "Fix parser task",
+                        "body": "Fixes #42",
+                    }
+                },
+            },
+        ]
+        reason = "existing open implementation PR: https://github.com/example/project/pull/43"
+        with (
+            patch.object(scout, "refresh_issue", return_value=(fresh, None)),
+            patch.object(paid_policy, "payment_signal", return_value=None),
+            patch.object(scout, "supplemental_payment_signal", return_value=None),
+            patch.object(github, "github_collection", return_value=timeline),
+            patch.object(
+                paid_verification,
+                "repository_open_implementation_pr_reason",
+            ) as repository_pr_check,
+            patch.object(scout, "linked_open_pr_reason", return_value=None),
+            patch.object(scout, "fetch_repo_metadata") as fetch_meta,
+        ):
+            self.assertEqual(scout.verify(fresh, "t", {}, {}), (None, reason))
+
+        repository_pr_check.assert_not_called()
+        fetch_meta.assert_not_called()
+
+    def test_verify_strategic_prefetched_timeline_uses_repository_pr_fallback(self) -> None:
+        fresh = issue(
+            body="Parser task",
+            title="Parser task",
+            comments=1,
+            labels=[{"name": "help wanted"}, {"name": "bug"}],
+        )
+        timeline = [
+            {
+                "event": "commented",
+                "body": "Thanks for the report.",
+                "author_association": "NONE",
+                "user": {"login": "observer"},
+                "created_at": "2026-10-01T00:00:00Z",
+                "updated_at": "2026-10-01T00:00:00Z",
+            }
+        ]
+        reason = "existing open implementation PR: https://github.com/example/project/pull/43"
+        with (
+            patch.object(scout, "refresh_issue", return_value=(fresh, None)),
+            patch.object(paid_policy, "payment_signal", return_value=None),
+            patch.object(scout, "supplemental_payment_signal", return_value=None),
+            patch.object(github, "github_collection", return_value=timeline),
+            patch.object(
+                paid_verification,
+                "repository_open_implementation_pr_reason",
+                return_value=reason,
+            ) as repository_pr_check,
+            patch.object(scout, "linked_open_pr_reason", return_value=None),
+            patch.object(scout, "fetch_repo_metadata") as fetch_meta,
+        ):
+            self.assertEqual(scout.verify(fresh, "t", {}, {}), (None, reason))
+
+        repository_pr_check.assert_called_once()
+        self.assertEqual(repository_pr_check.call_args.args, ("example/project", 42, "t"))
+        ignore_open_pull = repository_pr_check.call_args.kwargs["ignore_open_pull"]
+        self.assertFalse(
+            ignore_open_pull(
+                {
+                    "user": {"login": "developer"},
+                    "updated_at": "2026-10-01T00:00:00Z",
+                }
+            )
+        )
+        fetch_meta.assert_not_called()
+
+    def test_prefetched_strategic_competition_ignores_explicitly_superseded_pr(
+        self,
+    ) -> None:
+        fresh = issue(
+            body="Swap stress flake",
+            title="Swap stress flake",
+            comments=1,
+            labels=[{"name": "help wanted"}, {"name": "kind/flake"}],
+        )
+        comment_event: dict[str, Any] = {
+            "event": "commented",
+            "body": "Still flaking.",
+            "author_association": "CONTRIBUTOR",
+            "user": {"login": "harche"},
+            "created_at": "2026-10-08T16:03:46Z",
+            "updated_at": "2026-10-08T16:03:46Z",
+        }
+        timeline = [
+            comment_event,
+            {
+                "event": "unassigned",
+                "created_at": "2026-10-07T17:31:16Z",
+                "assignee": {"login": "isumitsolanki"},
+            },
+            {
+                "event": "labeled",
+                "created_at": "2026-10-08T16:03:50Z",
+                "label": {"name": "help wanted"},
+            },
+            {
+                "event": "cross-referenced",
+                "source": {
+                    "issue": {
+                        "pull_request": {},
+                        "state": "open",
+                        "html_url": "https://github.com/kubernetes/kubernetes/pull/138248",
+                        "repository_url": "https://api.github.com/repos/kubernetes/kubernetes",
+                        "title": "e2e_node: fix swap LimitedSwap stress flake",
+                        "body": "Fixes #42",
+                        "user": {"login": "isumitsolanki"},
+                        "updated_at": "2026-09-23T17:25:07Z",
+                    }
+                },
+            },
+        ]
+        stale_pull = {
+            "user": {"login": "isumitsolanki"},
+            "updated_at": "2026-09-23T17:25:07Z",
+            "html_url": "https://github.com/kubernetes/kubernetes/pull/138248",
+            "title": "e2e_node: fix swap LimitedSwap stress flake",
+            "body": "https://github.com/kubernetes/kubernetes/issues/138226",
+        }
+
+        def repository_check(
+            repository: str,
+            issue_number: int,
+            token: str | None,
+            *,
+            ignore_open_pull: Any,
+        ) -> str | None:
+            self.assertEqual((repository, issue_number, token), ("example/project", 42, "t"))
+            self.assertTrue(ignore_open_pull(stale_pull))
+            return None
+
+        with (
+            patch.object(
+                paid_verification,
+                "repository_open_implementation_pr_reason",
+                side_effect=repository_check,
+            ),
+            patch.object(scout, "linked_open_pr_reason", return_value=None),
+        ):
+            self.assertIsNone(
+                scout.strategic_competition_reason(
+                    fresh,
+                    "t",
+                    [cast(GitHubComment, comment_event)],
+                    timeline_events=timeline,
+                )
+            )
+
+    def test_zero_comment_strategic_competition_loads_lifecycle_timeline(
+        self,
+    ) -> None:
+        fresh = issue(
+            body="Reopened work",
+            title="Reopened work",
+            comments=0,
+            labels=[{"name": "help wanted"}],
+        )
+        timeline = [
+            {
+                "event": "unassigned",
+                "created_at": "2026-10-07T17:31:16Z",
+                "assignee": {"login": "old-dev"},
+            },
+            {
+                "event": "labeled",
+                "created_at": "2026-10-08T16:03:50Z",
+                "label": {"name": "help wanted"},
+            },
+        ]
+        stale_pull = {
+            "user": {"login": "old-dev"},
+            "updated_at": "2026-09-23T17:25:07Z",
+            "html_url": "https://github.com/example/project/pull/43",
+            "title": "Old fix",
+            "body": "Fixes #42",
+        }
+
+        def repository_check(
+            repository: str,
+            issue_number: int,
+            token: str | None,
+            *,
+            ignore_open_pull: Any,
+        ) -> str | None:
+            self.assertEqual((repository, issue_number, token), ("example/project", 42, "t"))
+            self.assertTrue(ignore_open_pull(stale_pull))
+            return None
+
+        with (
+            patch.object(
+                scout,
+                "_strategic_timeline_evidence",
+                return_value=([], timeline),
+            ) as timeline_fetch,
+            patch.object(
+                paid_verification,
+                "repository_open_implementation_pr_reason",
+                side_effect=repository_check,
+            ),
+            patch.object(scout, "linked_open_pr_reason", return_value=None),
+        ):
+            self.assertIsNone(scout.strategic_competition_reason(fresh, "t", []))
+
+        timeline_fetch.assert_called_once_with(fresh, "t")
 
     def test_verify_strategic_fails_closed_when_comments_cannot_refresh(self) -> None:
         fresh = issue(body="", title="Feature", comments=2)
