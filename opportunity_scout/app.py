@@ -274,6 +274,8 @@ def strategic_competition_reason(
     """Apply strategic-only competition checks through the extracted policy module."""
     loaded_comments = issue_comments(item, token) if comments is None else comments
     timeline_pr_checker: competition_policy.TimelinePrChecker = timeline_open_pr_reason
+    if timeline_events is None:
+        _, timeline_events = _strategic_timeline_evidence(item, token)
     if timeline_events is not None:
 
         def prefetched_timeline_pr_checker(
