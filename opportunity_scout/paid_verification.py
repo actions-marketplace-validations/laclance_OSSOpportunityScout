@@ -19,6 +19,7 @@ from opportunity_scout.types import GitHubIssue, SourceFailureReason
 FetchJson = Callable[[str, str | None], Any]
 ExistingPrChecker = Callable[[str, int, str | None], str | None]
 ActiveClaimChecker = Callable[[str, int, int, str | None], str | None]
+OpenPullRequestIgnore = Callable[[dict[str, Any]], bool]
 
 _TIMELINE_FAILURE: Final = "could not verify open implementation PR timeline"
 _OPEN_PULL_REQUEST_FAILURE: Final = "could not verify repository open implementation PRs"
@@ -238,6 +239,7 @@ def repository_open_implementation_pr_reason(
     token: str | None,
     *,
     fetch_open_pulls: FetchJson | None = None,
+    ignore_open_pull: OpenPullRequestIgnore | None = None,
 ) -> str | None:
     """Check cached same-repository open PRs when issue timelines omit relationships."""
     url = f"https://api.github.com/repos/{repo}/pulls?state=open&per_page=100"
@@ -275,6 +277,8 @@ def repository_open_implementation_pr_reason(
             body=body,
         )
         if evidence.implements_from_repository_listing(target):
+            if ignore_open_pull is not None and ignore_open_pull(raw_pull):
+                continue
             return f"existing open implementation PR: {html_url}"
     return None
 
